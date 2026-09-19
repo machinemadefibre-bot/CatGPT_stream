@@ -34,6 +34,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
         ("HEADLESS", "false", "Run the automated browser without a visible window."),
         ("BROWSER_CHANNEL", "chrome", "Playwright browser channel."),
         ("BROWSER_DATA_DIR", "browser_data", "Persistent browser-profile directory."),
+        ("BROWSER_PROXY_SERVER", "empty", "Optional Playwright proxy server, for example `socks5://tailscale-egress:1055`."),
         ("AUTO_LOGIN_INTERACTIVE", "auto", "Force (`true`) or disable (`false`) terminal login prompts; `auto` follows TTY availability."),
         ("SLOW_MO", "25", "Delay in milliseconds after Playwright operations."),
         ("MAX_CONCURRENT_REQUESTS", "3", "Maximum requests processed concurrently."),
