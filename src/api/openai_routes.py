@@ -1086,20 +1086,22 @@ Rules:
 
 _LATEST_REQUEST_MARKER = "Latest request to transform:\n"
 _USER_PROMPT_MARKER = "User prompt:"
-_REQUEST_MARKER_RE = re.compile(
-    rf"(?m)^(?:{re.escape(_LATEST_REQUEST_MARKER.rstrip())}|"
-    rf"{re.escape(_USER_PROMPT_MARKER)})[ \t]*(?:\r?\n)?"
+_REQUEST_MARKERS = (
+    _LATEST_REQUEST_MARKER.rstrip("\n"),
+    _USER_PROMPT_MARKER,
 )
 
 
 def _find_request_marker(prompt: str) -> tuple[int, str] | None:
-    """Return the last supported request marker in a flattened prompt."""
-    latest = None
-    for match in _REQUEST_MARKER_RE.finditer(prompt):
-        latest = match
-    if latest is None:
+    """Return whichever supported request marker occurs last."""
+    candidates = [
+        (prompt.rfind(marker), marker)
+        for marker in _REQUEST_MARKERS
+    ]
+    marker_index, marker_text = max(candidates, key=lambda item: item[0])
+    if marker_index < 0:
         return None
-    return latest.start(), latest.group(0)
+    return marker_index, marker_text
 
 
 def _create_prompt_prefix_attachment(prefix: str) -> str:
