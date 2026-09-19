@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import os
 import re
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from patchright.async_api import Page
 
@@ -45,6 +46,11 @@ from src.chatgpt.detector import (
 )
 from src.chatgpt.image_handler import extract_images_from_response
 from src.chatgpt.audio_handler import generate_read_aloud_audio
+from src.chatgpt.backend_stream import (
+    BackendSSEAccumulator,
+    DRAIN_BACKEND_QUEUE_SCRIPT,
+    LIVE_BACKEND_TEE_SCRIPT,
+)
 from src.chatgpt.models import ChatResponse
 from src.chatgpt.errors import PromptAttachmentFallbackError, PromptTooLongError
 from src.log import setup_logging
@@ -82,6 +88,10 @@ class ChatGPTClient:
         self._model_capabilities_checked_at = 0.0
         self._discovered_model_labels: list[str] = []
         self._recent_backend_events: list[dict] = []
+        # Shared by shallow bind_page() copies. Each page installs the fetch tee once,
+        # while captures remain request-scoped to the leased tab.
+        self._live_stream_setup_pages: dict[int, Page] = {}
+        self._live_stream_setup_lock = asyncio.Lock()
         self._wire_backend_event_logger()
 
     @property
@@ -138,6 +148,7 @@ class ChatGPTClient:
         model: str | None = None,
         reasoning_effort: str | None = None,
         read_aloud: bool = False,
+        on_delta: Callable[[str], Any] | None = None,
     ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
@@ -147,6 +158,8 @@ class ChatGPTClient:
             image_paths: Optional list of local file paths to images to attach.
             file_paths: Optional list of local file paths to non-image files (PDF, etc.).
             read_aloud: If True, trigger ChatGPT's "Read aloud" action and save audio.
+            on_delta: Optional callback receiving the latest full user-facing answer
+                while ChatGPT's backend SSE stream is still in progress.
 
         Steps:
         1. Simulate thinking pause
@@ -161,6 +174,8 @@ class ChatGPTClient:
         """
         all_attachments = (image_paths or []) + (file_paths or [])
         temporary_prompt_path: str | None = None
+        stream_stop: asyncio.Event | None = None
+        stream_task: asyncio.Task[None] | None = None
         log.info(f"Sending message ({len(text)} chars, {len(all_attachments)} attachments): {text[:80]}...")
         start_time = time.time()
 
@@ -227,6 +242,17 @@ class ChatGPTClient:
 
             # Small pause after pasting (like a human reviewing before send)
             await random_delay(300, 600)
+
+            # Install the backend fetch tee only for callers that actually asked for
+            # live deltas. The tee clones ChatGPT's own SSE response and leaves the
+            # original Response untouched for the web app.
+            if on_delta is not None:
+                await self._ensure_live_backend_stream()
+                await self._drain_live_backend_queue()
+                stream_stop = asyncio.Event()
+                stream_task = asyncio.create_task(
+                    self._poll_live_backend_stream(on_delta, stream_stop)
+                )
 
             auto_submitted = False
             sent = False
@@ -376,6 +402,20 @@ class ChatGPTClient:
                 has_audio=audio is not None,
             )
         finally:
+            if stream_stop is not None:
+                stream_stop.set()
+            if stream_task is not None:
+                try:
+                    await asyncio.wait_for(stream_task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    stream_task.cancel()
+                    try:
+                        await stream_task
+                    except asyncio.CancelledError:
+                        pass
+                except Exception as exc:
+                    log.debug("Live backend stream poller stopped with error: %s", exc)
+
             if temporary_prompt_path:
                 try:
                     Path(temporary_prompt_path).unlink(missing_ok=True)
@@ -924,6 +964,89 @@ class ChatGPTClient:
             return False
 
     # ── Private Helpers ─────────────────────────────────────────
+
+    async def _ensure_live_backend_stream(self) -> None:
+        """Install the in-page backend SSE fetch tee on the active tab."""
+        page = self._page
+        page_id = id(page)
+
+        async with self._live_stream_setup_lock:
+            installed = self._live_stream_setup_pages.get(page_id) is page
+            if not installed:
+                # Future navigations get the tee at document start.
+                await page.add_init_script(script=LIVE_BACKEND_TEE_SCRIPT)
+                self._live_stream_setup_pages[page_id] = page
+
+            # add_init_script does not retroactively run in the already-loaded
+            # document, so evaluate it as well. The JS guard makes this idempotent.
+            await page.evaluate(LIVE_BACKEND_TEE_SCRIPT)
+
+    async def _drain_live_backend_queue(self) -> list[list[Any]]:
+        """Atomically drain raw SSE chunks captured inside the active page."""
+        try:
+            rows = await self._page.evaluate(DRAIN_BACKEND_QUEUE_SCRIPT)
+        except Exception as exc:
+            log.debug("Could not drain live backend SSE queue: %s", exc)
+            return []
+        return rows if isinstance(rows, list) else []
+
+    async def _poll_live_backend_stream(
+        self,
+        on_delta: Callable[[str], Any],
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Drain one conversation SSE stream and emit growing final-answer text."""
+        accumulator = BackendSSEAccumulator()
+        bound_stream: str | None = None
+        last_emitted = ""
+        idle_after_stop = 0
+
+        while True:
+            rows = await self._drain_live_backend_queue()
+            saw_bound_data = False
+            stream_finished = False
+
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 3:
+                    continue
+                stream_id, chunk, done = row[0], row[1], row[2]
+                if not isinstance(stream_id, str):
+                    continue
+
+                if bound_stream is None:
+                    bound_stream = stream_id
+                if stream_id != bound_stream:
+                    continue
+
+                saw_bound_data = True
+                changed = False
+                if isinstance(chunk, str) and chunk:
+                    changed = accumulator.feed(chunk)
+                if done:
+                    changed = accumulator.end() or changed
+                    stream_finished = True
+
+                if changed and accumulator.text and accumulator.text != last_emitted:
+                    # The route layer converts this growing full text into append-only
+                    # protocol deltas. Calling with full text also lets it recover a
+                    # missed browser chunk without duplicating already-sent bytes.
+                    result = on_delta(accumulator.text)
+                    if inspect.isawaitable(result):
+                        await result
+                    last_emitted = accumulator.text
+
+            if stream_finished:
+                return
+
+            if stop_event.is_set():
+                if saw_bound_data or rows:
+                    idle_after_stop = 0
+                else:
+                    idle_after_stop += 1
+                    if idle_after_stop >= 3:
+                        return
+
+            await asyncio.sleep(0.05)
 
     def _wire_backend_event_logger(self) -> None:
         """Record recent ChatGPT backend responses for timeout diagnostics."""
