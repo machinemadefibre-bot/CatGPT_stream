@@ -224,6 +224,10 @@ class ResponseInputItem(BaseModel):
     type: str = "message"
     role: str = "user"
     content: Optional[Union[str, List[Any]]] = None
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+    call_id: Optional[str] = None
+    output: Optional[Any] = None
 
 
 class ResponsesRequest(BaseModel):
@@ -237,7 +241,9 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    tools: Optional[list[ToolDefinition]] = None
+    # Responses clients may send flat function tools and provider built-ins
+    # such as web_search. Route code normalizes supported function tools.
+    tools: Optional[list[dict[str, Any]]] = None
     tool_choice: Optional[Union[str, dict]] = None
     stream: Optional[bool] = False
     metadata: Optional[dict[str, Any]] = None
@@ -261,14 +267,17 @@ class ResponseOutputMessage(BaseModel):
     """An output message item in the Responses API response."""
     type: str = "message"
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
+    status: str = "completed"
     role: str = "assistant"
     content: list[ResponseOutputText] = Field(default_factory=list)
 
 
 class ResponseOutputToolCall(BaseModel):
-    """A tool call output item in the Responses API response."""
-    type: str = "tool_call"
-    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:24]}")
+    """A function-call output item in OpenAI Responses API format."""
+    type: str = "function_call"
+    id: str = Field(default_factory=lambda: f"fc_{uuid.uuid4().hex[:24]}")
+    call_id: Optional[str] = None
+    status: str = "completed"
     name: str = ""
     arguments: str = ""
 
@@ -285,6 +294,9 @@ class ResponsesResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:24]}")
     object: str = "response"
     created: int = Field(default_factory=lambda: int(time.time()))
+    created_at: Optional[int] = None
+    status: str = "completed"
     model: str = "catgpt-browser"
     output: list[Union[ResponseOutputMessage, ResponseOutputToolCall]] = Field(default_factory=list)
+    output_text: str = ""
     usage: ResponsesUsageInfo = Field(default_factory=ResponsesUsageInfo)
