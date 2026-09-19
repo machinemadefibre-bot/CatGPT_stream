@@ -1052,17 +1052,31 @@ class ChatGPTClient:
             await asyncio.sleep(0.05)
 
     def _wire_backend_event_logger(self) -> None:
-        """Record recent ChatGPT backend responses for timeout diagnostics."""
+        """Record recent ChatGPT backend and upload network events."""
         try:
             self._page.on("response", self._record_backend_response)
+            self._page.on("requestfailed", self._record_backend_request_failure)
         except Exception as e:
-            log.debug(f"Could not attach backend response logger: {e}")
+            log.debug(f"Could not attach backend network logger: {e}")
+
+    @staticmethod
+    def _is_diagnostic_network_url(url: str) -> bool:
+        return any(
+            marker in url
+            for marker in (
+                "backend-api",
+                "conversation",
+                "sentinel",
+                "chat-requirements",
+                "oaiusercontent.com",
+            )
+        )
 
     def _record_backend_response(self, response) -> None:
         """Best-effort synchronous Playwright response event handler."""
         try:
             url = getattr(response, "url", "") or ""
-            if not any(marker in url for marker in ("backend-api", "conversation", "sentinel", "chat-requirements")):
+            if not self._is_diagnostic_network_url(url):
                 return
             status = getattr(response, "status", None)
             self._recent_backend_events.append(
@@ -1073,6 +1087,35 @@ class ChatGPTClient:
                 }
             )
             self._recent_backend_events = self._recent_backend_events[-80:]
+            if "oaiusercontent.com" in url:
+                log.info("Upload/CDN response: status=%s url=%s", status, url[:500])
+        except Exception:
+            return
+
+    def _record_backend_request_failure(self, request) -> None:
+        """Record browser-level network failures, especially attachment uploads."""
+        try:
+            url = getattr(request, "url", "") or ""
+            if not self._is_diagnostic_network_url(url):
+                return
+            failure = getattr(request, "failure", None)
+            if callable(failure):
+                failure = failure()
+            failure_text = str(failure or "unknown browser network failure")
+            self._recent_backend_events.append(
+                {
+                    "ts": time.time(),
+                    "status": "failed",
+                    "failure": failure_text[:500],
+                    "url": url[:500],
+                }
+            )
+            self._recent_backend_events = self._recent_backend_events[-80:]
+            log.warning(
+                "Browser request failed: failure=%s url=%s",
+                failure_text[:500],
+                url[:500],
+            )
         except Exception:
             return
 
