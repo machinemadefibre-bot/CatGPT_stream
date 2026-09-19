@@ -327,6 +327,16 @@ def _responses_conversation_id(value: str | dict[str, Any] | None) -> str:
     return ""
 
 
+def _responses_has_stable_session(http_request: Request | None) -> bool:
+    """Return whether the client supplied an explicit reusable session identity."""
+    if http_request is None:
+        return False
+    return any(
+        bool((http_request.headers.get(header_name) or "").strip())
+        for header_name in ("x-session-id", "session-id")
+    )
+
+
 def _shrink_for_cache(value: Any) -> Any:
     """Reduce large strings to a digest so cache-key generation stays cheap."""
     if isinstance(value, str):
@@ -2496,7 +2506,7 @@ def _responses_input_to_messages(
                 if not isinstance(part, dict):
                     continue
                 part_type = part.get("type")
-                if part_type in {"input_text", "text"}:
+                if part_type in {"input_text", "text", "output_text"}:
                     normalized_parts.append({"type": "text", "text": part.get("text", "")})
                 elif part_type in {"input_image", "image"}:
                     image_url = part.get("image_url") or part.get("url")
@@ -2548,6 +2558,13 @@ def _responses_input_to_messages(
                     tool_call_id=call_id or None,
                 )
             )
+            continue
+
+        # Reasoning and other provider-owned output items are not user messages.
+        # In particular, Codex replays reasoning items from earlier Responses
+        # turns; treating them as role=user/content=None creates a fake blank
+        # user turn and breaks browser-thread reuse.
+        if item_type != "message":
             continue
 
         role = str(_item_value(item, "role", "user") or "user")
@@ -3420,7 +3437,13 @@ async def _execute_responses(
             conversation_id = f"response-branch:{request.previous_response_id}:{uuid.uuid4().hex[:12]}"
             seed_transcript = previous.transcript
     if not conversation_id:
-        conversation_id = f"response-chain:{uuid.uuid4().hex}"
+        if request.store is False and _responses_has_stable_session(http_request):
+            # Codex HTTP sends store=false but a stable session-id. Keep this
+            # request out of the durable SQLite response-chain store and let
+            # _tab_session_key/app-thread routing reuse the existing browser tab.
+            conversation_id = ""
+        else:
+            conversation_id = f"response-chain:{uuid.uuid4().hex}"
 
     chat_request = _responses_request_to_chat_request(request, conversation_id=conversation_id)
     chat_request.stream = False
