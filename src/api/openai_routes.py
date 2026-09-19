@@ -17,7 +17,9 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 import uuid
 from urllib.parse import urlparse
@@ -1072,6 +1074,45 @@ Rules:
 """
 
 
+def _create_tool_contract_attachment(tool_prompt: str) -> str:
+    """Write the large tool contract to a temporary Markdown attachment."""
+    digest = hashlib.sha256(tool_prompt.encode("utf-8")).hexdigest()[:12]
+    fd, filename = tempfile.mkstemp(
+        prefix=f"catgpt-tool-contract-{digest}-",
+        suffix=".md",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Tool contract for this turn\n\n")
+            handle.write(tool_prompt)
+            if not tool_prompt.endswith("\n"):
+                handle.write("\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(filename)
+        except OSError:
+            pass
+        raise
+    return filename
+
+
+def _apply_tool_attachment_to_messages(
+    messages: list[ChatMessage],
+    attachment_name: str,
+) -> list[ChatMessage]:
+    """Reference an attached tool contract instead of inlining all schemas."""
+    short_instruction = (
+        f"Read the attached Markdown file `{attachment_name}` as the authoritative "
+        "tool contract for this turn. Apply its record definitions and rules exactly; "
+        "do not summarize or ignore the attachment."
+    )
+    return _apply_tool_prompt_to_messages(messages, short_instruction)
+
+
 def _apply_tool_prompt_to_messages(
     messages: list[ChatMessage],
     tool_prompt: str,
@@ -2090,6 +2131,13 @@ async def _execute_image_generation(
 
             return ImagesResponse(data=image_data_list)
     finally:
+        if tool_contract_path:
+            try:
+                os.unlink(tool_contract_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.debug("Could not remove temporary tool contract %s: %s", tool_contract_path, exc)
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
@@ -3424,6 +3472,7 @@ async def _execute_chat_completion(
 
     # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
+    tool_contract_path: str | None = None
 
     try:
         async with acquire_browser_page(session_key) as lease:
@@ -3565,13 +3614,27 @@ async def _execute_chat_completion(
             # -- Build the prompt --------------------------------
             messages = list(request.messages)
 
-            # Tool definitions are request-scoped. Attach them to the latest
-            # user turn so sticky browser conversations receive the current
-            # catalog even when older history is pruned.
+            # Tool definitions are request-scoped. For ChatGPT, keep the huge
+            # schema/rules block out of the composer by uploading it as Markdown;
+            # the typed prompt contains only a short pointer plus the latest request.
+            # Other providers retain the existing inline behavior.
             if request.tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
                 if tool_system:
-                    messages = _apply_tool_prompt_to_messages(messages, tool_system)
+                    if isinstance(client, ChatGPTClient):
+                        tool_contract_path = _create_tool_contract_attachment(tool_system)
+                        file_paths.append(tool_contract_path)
+                        messages = _apply_tool_attachment_to_messages(
+                            messages,
+                            os.path.basename(tool_contract_path),
+                        )
+                        log.info(
+                            "Tool contract moved to Markdown attachment: %s (%d chars)",
+                            os.path.basename(tool_contract_path),
+                            len(tool_system),
+                        )
+                    else:
+                        messages = _apply_tool_prompt_to_messages(messages, tool_system)
 
             # If structured output is requested, force strict JSON response
             response_format_system = _build_response_format_system_prompt(effective_response_format)
