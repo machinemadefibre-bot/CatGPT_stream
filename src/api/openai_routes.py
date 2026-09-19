@@ -177,10 +177,14 @@ def _tab_session_key(
 ) -> str | None:
     """Stable tab identity: session header, thread id, app key, then user."""
     if http_request is not None:
-        for header_name in ("x-session-id", "session-id"):
+        # Codex sends both thread-id and session-id. thread-id identifies the
+        # current Codex conversation, while session-id is also used for broader
+        # cache/session affinity. Keep different Codex threads on different
+        # browser conversations.
+        for header_name in ("thread-id", "x-session-id", "session-id"):
             value = (http_request.headers.get(header_name) or "").strip()
             if value:
-                return value
+                return f"{header_name}:{value}"
     conversation_id = (getattr(request, "conversation_id", None) or "").strip()
     if conversation_id:
         return f"conversation:{conversation_id}"
@@ -333,7 +337,7 @@ def _responses_has_stable_session(http_request: Request | None) -> bool:
         return False
     return any(
         bool((http_request.headers.get(header_name) or "").strip())
-        for header_name in ("x-session-id", "session-id")
+        for header_name in ("thread-id", "x-session-id", "session-id")
     )
 
 
@@ -3104,15 +3108,18 @@ async def _stream_responses(
                 task.cancel()
             for event in close_reasoning_events():
                 yield event
-            yield emit(
-                "error",
-                {
+            failed_response = {
+                **base_response,
+                "status": "failed",
+                "error": {
                     "code": "server_error",
                     "message": str(exc),
-                    "param": None,
                 },
+            }
+            yield emit(
+                "response.failed",
+                {"response": failed_response},
             )
-            yield "data: [DONE]\n\n"
             return
 
         for event in close_reasoning_events():
