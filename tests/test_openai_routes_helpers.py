@@ -806,6 +806,90 @@ class ResponsesAPITests(unittest.TestCase):
 
         self.assertIn(b"response.created", first)
 
+    def test_responses_accepts_flat_function_and_builtin_tools(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input="hello",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object"},
+                },
+                {"type": "web_search", "external_web_access": False},
+            ],
+            tool_choice={"type": "function", "name": "shell"},
+        )
+
+        converted = _responses_request_to_chat_request(req)
+
+        self.assertEqual(len(converted.tools or []), 1)
+        self.assertEqual(converted.tools[0].function.name, "shell")
+        self.assertEqual(
+            converted.tool_choice,
+            {"type": "function", "function": {"name": "shell"}},
+        )
+
+    def test_responses_function_call_input_round_trip(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input=[
+                {"role": "user", "content": "Run echo hello"},
+                {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": '{"command":["echo","hello"]}',
+                    "call_id": "call_123",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "hello",
+                },
+            ],
+        )
+
+        messages = _responses_input_to_messages(req.input)
+
+        self.assertEqual([m.role for m in messages], ["user", "assistant", "tool"])
+        self.assertEqual(messages[1].tool_calls[0].id, "call_123")
+        self.assertEqual(messages[1].tool_calls[0].function.name, "shell")
+        self.assertEqual(messages[2].tool_call_id, "call_123")
+        self.assertEqual(messages[2].content, "hello")
+
+    def test_responses_function_call_output_shape(self) -> None:
+        chat_response = ChatCompletionResponse(
+            model="catgpt-browser",
+            choices=[
+                Choice(
+                    message=ChoiceMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id="call_123",
+                                function=FunctionCallInfo(
+                                    name="shell",
+                                    arguments='{"command":["pwd"]}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=UsageInfo(input_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        response = _responses_response_from_chat(chat_response, "catgpt-browser")
+
+        self.assertEqual(response.status, "completed")
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(len(response.output), 1)
+        self.assertEqual(response.output[0].type, "function_call")
+        self.assertEqual(response.output[0].call_id, "call_123")
+        self.assertEqual(response.output[0].name, "shell")
+
     def test_responses_stream_emits_thinking_live_text_and_completed(self) -> None:
         async def fake_execute_responses(
             request: ResponsesRequest,
