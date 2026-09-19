@@ -600,6 +600,101 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(messages[0].content[0]["type"], "text")
         self.assertEqual(messages[0].content[0]["text"], "Hello")
 
+    def test_responses_input_skips_reasoning_and_normalizes_output_text(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking..."}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Previous answer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Next turn"}],
+                },
+            ],
+        )
+
+        messages = _responses_input_to_messages(req.input)
+
+        self.assertEqual([message.role for message in messages], ["assistant", "user"])
+        assert isinstance(messages[0].content, list)
+        self.assertEqual(messages[0].content[0], {"type": "text", "text": "Previous answer"})
+        assert isinstance(messages[1].content, list)
+        self.assertEqual(messages[1].content[0], {"type": "text", "text": "Next turn"})
+
+    def test_store_false_responses_with_session_header_reuse_browser_session(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            captured["conversation_id"] = request.conversation_id
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Hello",
+                store=False,
+            )
+            asyncio.run(
+                openai_routes_module._execute_responses(
+                    req,
+                    http_request=_make_request({"session-id": "codex-session-123"}),
+                )
+            )
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        # No synthetic response-chain id means _execute_chat_completion can use
+        # the stable session header/app routing instead of forcing new_chat().
+        self.assertIsNone(captured["conversation_id"])
+
+    def test_store_false_responses_without_session_remain_stateless(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            captured["conversation_id"] = request.conversation_id
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Hello",
+                store=False,
+            )
+            asyncio.run(openai_routes_module._execute_responses(req))
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        conversation_id = captured["conversation_id"]
+        self.assertIsNotNone(conversation_id)
+        assert conversation_id is not None
+        self.assertTrue(conversation_id.startswith("response-chain:"))
+
     def test_responses_request_to_chat_request_basic(self) -> None:
         """ResponsesRequest translates to ChatCompletionRequest."""
         req = ResponsesRequest(
