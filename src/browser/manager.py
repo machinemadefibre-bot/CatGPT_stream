@@ -323,8 +323,13 @@ class BrowserManager:
         )
         proxy_server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()
         if proxy_server:
+            # Chromium may otherwise prefer HTTP/3/QUIC for upload/CDN hosts.
+            # SOCKS proxying here is TCP-only, so force proxied browser traffic
+            # onto TCP (HTTP/2 or HTTP/1.1) instead of allowing a UDP QUIC path
+            # that bypasses or fails outside the proxy tunnel.
+            chrome_args.append("--disable-quic")
             launch_kwargs["proxy"] = {"server": proxy_server}
-            log.info("Browser proxy enabled")
+            log.info("Browser proxy enabled; QUIC disabled for TCP-only proxy transport")
 
         if in_docker:
             launch_kwargs["no_viewport"] = True
