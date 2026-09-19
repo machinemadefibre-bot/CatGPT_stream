@@ -26,11 +26,13 @@ These are the variables consumed directly by `docker-compose.yml`:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `DOCKERDIR` | `.` | Host directory under which persistent `appdata/catgpt` volumes are created. |
-| `CATGPT_IMAGE` | `ghcr.io/thebadfella/catgpt:latest` | Container image used by Compose. |
+| `CATGPT_IMAGE` | `catgpt-local:latest` | Container image built/used by Compose. |
 | `CATGPT_PULL_POLICY` | `missing` | Compose image pull policy. |
 | `CATGPT_USER_ID` | `1000` | Host user ID mapped to container `USER_ID`. |
 | `CATGPT_GROUP_ID` | `1000` | Host group ID mapped to container `GROUP_ID`. |
+| `BROWSER_PROXY_SERVER` | _empty_ | Optional browser-only proxy passed through to the container. |
 | `CATGPT_API_KEY` | `dummy123` | Value passed to container `API_TOKEN`. |
+| `API_TOKEN_OPTIONAL` | `false` | Allow unauthenticated API requests when a token is configured. |
 | `CATGPT_VNC_PASSWORD` | `catgpt` | Value passed to container `VNC_PASSWORD`. |
 | `PROVIDER` | `chatgpt` | Provider passed through to the container. |
 | `MINIMAX_REGION` | `global_en` | MiniMax region passed through to the container. |
