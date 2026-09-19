@@ -312,6 +312,11 @@ class BrowserManager:
             timezone_id="America/Los_Angeles",
             args=chrome_args,
         )
+        proxy_server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()
+        if proxy_server:
+            launch_kwargs["proxy"] = {"server": proxy_server}
+            log.info("Browser proxy enabled")
+
         if in_docker:
             launch_kwargs["no_viewport"] = True
         else:
