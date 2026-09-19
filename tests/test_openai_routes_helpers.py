@@ -80,6 +80,7 @@ from src.api.openai_routes import (
     _validate_responses_request,
 )
 from src.api.browser_gate import browser_access_lock
+from src.chatgpt.client import ChatGPTClient
 from src.api import routes as native_routes
 from src.api import openai_routes as openai_routes_module
 from src.api.attachment_expander import AttachmentPageDescriptor
@@ -133,6 +134,16 @@ async def _collect_stream(stream_response) -> list[bytes]:
 
 
 class OpenAIRoutesHelpersTests(unittest.TestCase):
+    def test_generic_long_prompt_attachment_is_lossless_markdown(self) -> None:
+        text = "# Long request\n\nKeep *all* punctuation exactly.\n中文也要保留。\n"
+        path = ChatGPTClient._create_prompt_attachment(text)
+        try:
+            self.assertTrue(path.endswith(".md"))
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), text)
+        finally:
+            os.unlink(path)
+
     def test_fresh_thread_header_validation(self) -> None:
         self.assertTrue(_fresh_thread_from_header(_make_request({"x-catgpt-thread-mode": "fresh"})))
         self.assertFalse(_fresh_thread_from_header(_make_request()))
@@ -629,7 +640,7 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(chat_req.reasoning_effort, "high")
 
     def test_validate_chat_request_accepts_stream(self) -> None:
-        """Stream=true is allowed; route handlers emit pseudo-SSE after completion."""
+        """Stream=true is allowed; ChatGPT can forward live backend SSE deltas."""
         req = ChatCompletionRequest(
             model="catgpt-browser",
             messages=[ChatMessage(role="user", content="hello")],
