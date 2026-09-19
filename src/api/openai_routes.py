@@ -3777,10 +3777,11 @@ async def _execute_chat_completion(
                 prompt = f"{attachment_prefix}{prompt}" if prompt else attachment_prefix.strip()
                 full_prompt = f"{attachment_prefix}{full_prompt}" if full_prompt else attachment_prefix.strip()
 
-            # Codex tool requests can place tens of thousands of characters before
-            # either the legacy "Latest request to transform:" marker or the newer
-            # "User prompt:" marker. Use whichever supported marker occurs last so a
-            # wrapper marker cannot leave a second giant prompt prefix in the composer.
+            # Work-style tool prompts use "Latest request to transform:" while
+            # Codex-style prompts use "User prompt:". Both formats externalize the
+            # complete prefix into one Markdown attachment and leave the request itself
+            # in the browser composer. If a wrapper ever introduces both, the last
+            # marker remains the safest request boundary.
             request_marker = _find_request_marker(full_prompt)
             if (
                 isinstance(client, ChatGPTClient)
