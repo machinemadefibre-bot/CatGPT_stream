@@ -3783,18 +3783,7 @@ async def _execute_chat_completion(
             # in the browser composer. If a wrapper ever introduces both, the last
             # marker remains the safest request boundary.
             request_marker = _find_request_marker(full_prompt)
-            marker_is_codex_user_prompt = bool(
-                request_marker
-                and request_marker[1].strip() == _USER_PROMPT_MARKER
-            )
-            should_externalize_context = bool(
-                request_marker
-                and (
-                    marker_is_codex_user_prompt
-                    or (request.tools and request.tool_choice != "none")
-                )
-            )
-            if isinstance(client, ChatGPTClient) and should_externalize_context:
+            if isinstance(client, ChatGPTClient) and request_marker is not None:
                 marker_index, marker_text = request_marker
                 externalized_prefix = full_prompt[:marker_index].rstrip()
                 if externalized_prefix:
