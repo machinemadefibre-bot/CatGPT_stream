@@ -1087,7 +1087,8 @@ Rules:
 _LATEST_REQUEST_MARKER = "Latest request to transform:\n"
 _USER_PROMPT_MARKER = "User prompt:"
 _REQUEST_MARKER_RE = re.compile(
-    r"(?m)^(?:Latest request to transform:|User prompt:)[ \\t]*(?:\\r?\\n)?"
+    rf"(?m)^(?:{re.escape(_LATEST_REQUEST_MARKER.rstrip())}|"
+    rf"{re.escape(_USER_PROMPT_MARKER)})[ \t]*(?:\r?\n)?"
 )
 
 
@@ -1102,7 +1103,7 @@ def _find_request_marker(prompt: str) -> tuple[int, str] | None:
 
 
 def _create_prompt_prefix_attachment(prefix: str) -> str:
-    """Persist everything before the latest-request marker as Markdown."""
+    """Persist everything before the selected request marker as Markdown."""
     digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
     fd, filename = tempfile.mkstemp(
         prefix=f"catgpt-request-context-{digest}-",
