@@ -1085,6 +1085,20 @@ Rules:
 
 
 _LATEST_REQUEST_MARKER = "Latest request to transform:\n"
+_USER_PROMPT_MARKER = "User prompt:"
+_REQUEST_MARKER_RE = re.compile(
+    r"(?m)^(?:Latest request to transform:|User prompt:)[ \\t]*(?:\\r?\\n)?"
+)
+
+
+def _find_request_marker(prompt: str) -> tuple[int, str] | None:
+    """Return the last supported request marker in a flattened prompt."""
+    latest = None
+    for match in _REQUEST_MARKER_RE.finditer(prompt):
+        latest = match
+    if latest is None:
+        return None
+    return latest.start(), latest.group(0)
 
 
 def _create_prompt_prefix_attachment(prefix: str) -> str:
@@ -1116,16 +1130,17 @@ def _externalize_latest_request_prefix(
     prompt: str,
     attachment_name: str,
 ) -> str:
-    """Replace all text before Latest request to transform with one file pointer."""
-    marker_index = prompt.rfind(_LATEST_REQUEST_MARKER)
-    if marker_index < 0:
+    """Replace text before the last supported request marker with one file pointer."""
+    marker = _find_request_marker(prompt)
+    if marker is None:
         return prompt
-    latest_request = prompt[marker_index + len(_LATEST_REQUEST_MARKER):]
+    marker_index, _ = marker
+    latest_request = prompt[marker_index:]
     return (
         f"Read the attached Markdown file `{attachment_name}` first. It contains "
         "all context, system instructions, tool definitions, and rules that originally "
-        "preceded the latest-request marker for this turn. Apply that file exactly.\n\n"
-        f"{_LATEST_REQUEST_MARKER}{latest_request}"
+        "preceded the final request marker for this turn. Apply that file exactly.\n\n"
+        f"{latest_request}"
     )
 
 
@@ -3762,26 +3777,28 @@ async def _execute_chat_completion(
                 full_prompt = f"{attachment_prefix}{full_prompt}" if full_prompt else attachment_prefix.strip()
 
             # Codex tool requests can place tens of thousands of characters before
-            # "Latest request to transform:".  For ChatGPT browser turns, upload that
-            # entire final prefix (including system instructions + tool schemas) as one
-            # Markdown attachment and type only a tiny pointer plus the actual request.
+            # either the legacy "Latest request to transform:" marker or the newer
+            # "User prompt:" marker. Use whichever supported marker occurs last so a
+            # wrapper marker cannot leave a second giant prompt prefix in the composer.
+            request_marker = _find_request_marker(full_prompt)
             if (
                 isinstance(client, ChatGPTClient)
                 and request.tools
                 and request.tool_choice != "none"
-                and _LATEST_REQUEST_MARKER in full_prompt
+                and request_marker is not None
             ):
-                marker_index = full_prompt.rfind(_LATEST_REQUEST_MARKER)
+                marker_index, marker_text = request_marker
                 externalized_prefix = full_prompt[:marker_index].rstrip()
                 if externalized_prefix:
                     prompt_prefix_path = _create_prompt_prefix_attachment(externalized_prefix)
                     file_paths.append(prompt_prefix_path)
                     attachment_name = os.path.basename(prompt_prefix_path)
                     full_prompt = _externalize_latest_request_prefix(full_prompt, attachment_name)
-                    if _LATEST_REQUEST_MARKER in prompt:
+                    if _find_request_marker(prompt) is not None:
                         prompt = _externalize_latest_request_prefix(prompt, attachment_name)
                     log.info(
-                        "Externalized pre-request context to Markdown: %s (%d chars removed from composer)",
+                        "Externalized pre-request context to Markdown at %r: %s (%d chars removed from composer)",
+                        marker_text.strip(),
                         attachment_name,
                         len(externalized_prefix),
                     )
