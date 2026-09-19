@@ -157,6 +157,9 @@ In Cline, choose **OpenAI Compatible**, set Base URL to `http://localhost:8650/c
 > [!NOTE]
 > For the ChatGPT browser provider, `stream=true` now forwards live user-facing text from ChatGPT's own `/backend-api/conversation` SSE stream. Responses streams open immediately with a short `thinking...` reasoning-summary status item and periodic keep-alive comments while the model is still reasoning. Tool calls are still validated by CatGPT's existing structured parser and are emitted as function-call events once the tool payload is complete. Other browser providers retain completion-then-stream compatibility behavior.
 
+> [!TIP]
+> On ChatGPT tool/function requests, CatGPT externalizes everything before `Latest request to transform:` into a temporary Markdown attachment. The browser composer receives only a short attachment pointer plus the latest request, avoiding very large first-turn Codex system/tool prompts while preserving the complete original context in the uploaded file.
+
 ## Essential Configuration
 
 | Variable | Default | Purpose |
