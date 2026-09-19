@@ -3028,8 +3028,9 @@ async def _stream_responses(
             output_index = next_output_index
             next_output_index += 1
             call_id = tool.id
+            function_item_id = f"fc_{uuid.uuid4().hex[:24]}"
             added_item = {
-                "id": tool.id,
+                "id": function_item_id,
                 "type": "function_call",
                 "status": "in_progress",
                 "call_id": call_id,
@@ -3044,7 +3045,7 @@ async def _stream_responses(
                 yield emit(
                     "response.function_call_arguments.delta",
                     {
-                        "item_id": tool.id,
+                        "item_id": function_item_id,
                         "output_index": output_index,
                         "delta": tool.arguments,
                     },
@@ -3052,7 +3053,7 @@ async def _stream_responses(
             yield emit(
                 "response.function_call_arguments.done",
                 {
-                    "item_id": tool.id,
+                    "item_id": function_item_id,
                     "output_index": output_index,
                     "name": tool.name,
                     "arguments": tool.arguments,
@@ -3076,6 +3077,7 @@ async def _stream_responses(
                 "created_at": response_dict.get("created", created),
                 "status": "completed",
                 "output": completed_output,
+                "output_text": final_text,
             }
         )
         yield emit(
