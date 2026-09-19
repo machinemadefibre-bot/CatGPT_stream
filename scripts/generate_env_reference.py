@@ -34,6 +34,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
         ("HEADLESS", "false", "Run the automated browser without a visible window."),
         ("BROWSER_CHANNEL", "chrome", "Playwright browser channel."),
         ("BROWSER_DATA_DIR", "browser_data", "Persistent browser-profile directory."),
+        ("BROWSER_PROXY_SERVER", "empty", "Optional Playwright proxy server, for example `socks5://tailscale-egress:1055`."),
         ("AUTO_LOGIN_INTERACTIVE", "auto", "Force (`true`) or disable (`false`) terminal login prompts; `auto` follows TTY availability."),
         ("SLOW_MO", "25", "Delay in milliseconds after Playwright operations."),
         ("MAX_CONCURRENT_REQUESTS", "3", "Maximum requests processed concurrently."),
@@ -111,11 +112,13 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
 
 COMPOSE_INPUTS: tuple[tuple[str, str, str], ...] = (
     ("DOCKERDIR", ".", "Host directory under which persistent `appdata/catgpt` volumes are created."),
-    ("CATGPT_IMAGE", "ghcr.io/thebadfella/catgpt:latest", "Container image used by Compose."),
+    ("CATGPT_IMAGE", "catgpt-local:latest", "Container image built/used by Compose."),
     ("CATGPT_PULL_POLICY", "missing", "Compose image pull policy."),
     ("CATGPT_USER_ID", "1000", "Host user ID mapped to container `USER_ID`."),
     ("CATGPT_GROUP_ID", "1000", "Host group ID mapped to container `GROUP_ID`."),
+    ("BROWSER_PROXY_SERVER", "empty", "Optional browser-only proxy passed through to the container."),
     ("CATGPT_API_KEY", "dummy123", "Value passed to container `API_TOKEN`."),
+    ("API_TOKEN_OPTIONAL", "false", "Allow unauthenticated API requests when a token is configured."),
     ("CATGPT_VNC_PASSWORD", "catgpt", "Value passed to container `VNC_PASSWORD`."),
     ("PROVIDER", "chatgpt", "Provider passed through to the container."),
     ("MINIMAX_REGION", "global_en", "MiniMax region passed through to the container."),

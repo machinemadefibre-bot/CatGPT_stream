@@ -17,11 +17,13 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 import uuid
 from urllib.parse import urlparse
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -175,10 +177,14 @@ def _tab_session_key(
 ) -> str | None:
     """Stable tab identity: session header, thread id, app key, then user."""
     if http_request is not None:
-        for header_name in ("x-session-id", "session-id"):
+        # Codex sends both thread-id and session-id. thread-id identifies the
+        # current Codex conversation, while session-id is also used for broader
+        # cache/session affinity. Keep different Codex threads on different
+        # browser conversations.
+        for header_name in ("thread-id", "x-session-id", "session-id"):
             value = (http_request.headers.get(header_name) or "").strip()
             if value:
-                return value
+                return f"{header_name}:{value}"
     conversation_id = (getattr(request, "conversation_id", None) or "").strip()
     if conversation_id:
         return f"conversation:{conversation_id}"
@@ -323,6 +329,16 @@ def _responses_conversation_id(value: str | dict[str, Any] | None) -> str:
     if isinstance(value, dict):
         return str(value.get("id") or "").strip()
     return ""
+
+
+def _responses_has_stable_session(http_request: Request | None) -> bool:
+    """Return whether the client supplied an explicit reusable session identity."""
+    if http_request is None:
+        return False
+    return any(
+        bool((http_request.headers.get(header_name) or "").strip())
+        for header_name in ("thread-id", "x-session-id", "session-id")
+    )
 
 
 def _shrink_for_cache(value: Any) -> Any:
@@ -1070,6 +1086,69 @@ Rules:
 - Never place literal control characters inside a JSON string.
 - {choice_rule}
 """
+
+
+_LATEST_REQUEST_MARKER = "Latest request to transform:\n"
+_USER_PROMPT_MARKER = "User prompt:"
+_REQUEST_MARKERS = (
+    _LATEST_REQUEST_MARKER.rstrip("\n"),
+    _USER_PROMPT_MARKER,
+)
+
+
+def _find_request_marker(prompt: str) -> tuple[int, str] | None:
+    """Return whichever supported request marker occurs last."""
+    candidates = [
+        (prompt.rfind(marker), marker)
+        for marker in _REQUEST_MARKERS
+    ]
+    marker_index, marker_text = max(candidates, key=lambda item: item[0])
+    if marker_index < 0:
+        return None
+    return marker_index, marker_text
+
+
+def _create_prompt_prefix_attachment(prefix: str) -> str:
+    """Persist everything before the selected request marker as Markdown."""
+    digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
+    fd, filename = tempfile.mkstemp(
+        prefix=f"catgpt-request-context-{digest}-",
+        suffix=".md",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Context and tool contract for this turn\n\n")
+            handle.write(prefix.rstrip())
+            handle.write("\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(filename)
+        except OSError:
+            pass
+        raise
+    return filename
+
+
+def _externalize_latest_request_prefix(
+    prompt: str,
+    attachment_name: str,
+) -> str:
+    """Replace text before the last supported request marker with one file pointer."""
+    marker = _find_request_marker(prompt)
+    if marker is None:
+        return prompt
+    marker_index, _ = marker
+    latest_request = prompt[marker_index:]
+    return (
+        f"Read the attached Markdown file `{attachment_name}` first. It contains "
+        "all context, system instructions, tool definitions, and rules that originally "
+        "preceded the final request marker for this turn. Apply that file exactly.\n\n"
+        f"{latest_request}"
+    )
 
 
 def _apply_tool_prompt_to_messages(
@@ -2020,7 +2099,7 @@ async def _execute_image_generation(
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -2090,6 +2169,13 @@ async def _execute_image_generation(
 
             return ImagesResponse(data=image_data_list)
     finally:
+        if prompt_prefix_path:
+            try:
+                os.unlink(prompt_prefix_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.debug("Could not remove temporary prompt-prefix attachment %s: %s", prompt_prefix_path, exc)
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
@@ -2422,17 +2508,18 @@ def _responses_input_to_messages(
     input_data: str | list,
     instructions: str | None = None,
 ) -> list:
-    """Convert Responses API input to ChatCompletionRequest messages list.
-
-    Supports both string and list-of-input-item formats.
-    Instructions field is prepended as a system message when present.
-    """
+    """Convert Responses input items into the browser chat message model."""
     from src.api.openai_schemas import ChatMessage
 
-    messages = []
+    messages: list[ChatMessage] = []
 
     if instructions:
         messages.append(ChatMessage(role="system", content=instructions))
+
+    def _item_value(item: Any, key: str, default: Any = None) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
 
     def _normalize_content(content: Any):
         if isinstance(content, list):
@@ -2441,7 +2528,7 @@ def _responses_input_to_messages(
                 if not isinstance(part, dict):
                     continue
                 part_type = part.get("type")
-                if part_type in {"input_text", "text"}:
+                if part_type in {"input_text", "text", "output_text"}:
                     normalized_parts.append({"type": "text", "text": part.get("text", "")})
                 elif part_type in {"input_image", "image"}:
                     image_url = part.get("image_url") or part.get("url")
@@ -2455,19 +2542,111 @@ def _responses_input_to_messages(
 
     if isinstance(input_data, str):
         messages.append(ChatMessage(role="user", content=input_data))
-    elif isinstance(input_data, list):
-        for item in input_data:
-            if isinstance(item, dict):
-                role = item.get("role") or "user"
-                content = _normalize_content(item.get("content"))
-            else:
-                role = getattr(item, "role", "user") or "user"
-                content = _normalize_content(getattr(item, "content", None))
-            messages.append(ChatMessage(role=role, content=content))
-    else:
-        messages.append(ChatMessage(role="user", content=str(input_data)))
+        return messages
+
+    for item in input_data:
+        item_type = str(_item_value(item, "type", "message") or "message")
+
+        if item_type == "function_call":
+            name = str(_item_value(item, "name", "") or "").strip()
+            arguments = _item_value(item, "arguments", "{}")
+            call_id = str(_item_value(item, "call_id", "") or "").strip()
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            if name:
+                messages.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id=call_id or f"call_{uuid.uuid4().hex[:24]}",
+                                function=FunctionCallInfo(name=name, arguments=arguments),
+                            )
+                        ],
+                    )
+                )
+            continue
+
+        if item_type == "function_call_output":
+            call_id = str(_item_value(item, "call_id", "") or "").strip()
+            output = _item_value(item, "output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
+            messages.append(
+                ChatMessage(
+                    role="tool",
+                    content=output,
+                    tool_call_id=call_id or None,
+                )
+            )
+            continue
+
+        # Reasoning and other provider-owned output items are not user messages.
+        # In particular, Codex replays reasoning items from earlier Responses
+        # turns; treating them as role=user/content=None creates a fake blank
+        # user turn and breaks browser-thread reuse.
+        if item_type != "message":
+            continue
+
+        role = str(_item_value(item, "role", "user") or "user")
+        content = _normalize_content(_item_value(item, "content"))
+        messages.append(ChatMessage(role=role, content=content))
 
     return messages
+
+
+def _responses_function_tools(
+    tools: list[dict[str, Any]] | None,
+) -> list[ToolDefinition] | None:
+    """Normalize flat/nested Responses function tools; ignore provider built-ins."""
+    normalized: list[ToolDefinition] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type") or "function") != "function":
+            continue
+
+        nested = tool.get("function")
+        source = nested if isinstance(nested, dict) else tool
+        name = str(source.get("name") or "").strip()
+        if not name:
+            continue
+
+        parameters = source.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+
+        normalized.append(
+            ToolDefinition(
+                type="function",
+                function=FunctionDefinition(
+                    name=name,
+                    description=str(source.get("description") or ""),
+                    parameters=parameters,
+                ),
+            )
+        )
+    return normalized or None
+
+
+def _responses_tool_choice(
+    choice: str | dict[str, Any] | None,
+) -> str | dict[str, Any] | None:
+    """Translate Responses flat function choices to Chat Completions shape."""
+    if not isinstance(choice, dict):
+        return choice
+
+    choice_type = str(choice.get("type") or "")
+    if choice_type == "function" and "function" not in choice:
+        name = str(choice.get("name") or "").strip()
+        if name:
+            return {"type": "function", "function": {"name": name}}
+
+    if choice_type and choice_type != "function":
+        return "auto"
+
+    return choice
 
 
 def _responses_request_to_chat_request(
@@ -2476,12 +2655,13 @@ def _responses_request_to_chat_request(
 ) -> ChatCompletionRequest:
     """Translate a ResponsesRequest into a ChatCompletionRequest for execution."""
     messages = _responses_input_to_messages(resp_req.input, resp_req.instructions)
+    function_tools = _responses_function_tools(resp_req.tools)
 
     return ChatCompletionRequest(
         model=resp_req.model,
         messages=messages,
-        tools=resp_req.tools,
-        tool_choice=resp_req.tool_choice,
+        tools=function_tools,
+        tool_choice=_responses_tool_choice(resp_req.tool_choice),
         temperature=resp_req.temperature,
         max_tokens=resp_req.max_output_tokens,
         top_p=resp_req.top_p,
@@ -2496,36 +2676,45 @@ def _responses_request_to_chat_request(
 def _responses_response_from_chat(
     chat_response: ChatCompletionResponse,
     model: str,
+    response_id: str | None = None,
 ) -> ResponsesResponse:
-    """Translate a ChatCompletionResponse into a Responses API response envelope.
-
-    Converts choices[0].message.content into response output items.
-    """
+    """Translate a Chat Completion response into Responses API shape."""
     output_items: list[ResponseOutputMessage | ResponseOutputToolCall] = []
+    text_parts: list[str] = []
 
     for choice in chat_response.choices:
         msg_text = choice.message.content or ""
-        output_items.append(
-            ResponseOutputMessage(
-                content=[
-                    ResponseOutputText(text=msg_text),
-                ],
+        if msg_text:
+            text_parts.append(msg_text)
+            output_items.append(
+                ResponseOutputMessage(
+                    status="completed",
+                    content=[ResponseOutputText(text=msg_text)],
+                )
             )
-        )
-        tool_calls = choice.message.tool_calls or []
-        for call in tool_calls:
+
+        for call in choice.message.tool_calls or []:
             output_items.append(
                 ResponseOutputToolCall(
-                    id=call.id,
+                    id=f"fc_{uuid.uuid4().hex[:24]}",
+                    call_id=call.id,
+                    status="completed",
                     name=call.function.name,
                     arguments=call.function.arguments,
                 )
             )
 
+    resolved_response_id = (
+        response_id
+        or (f"resp_{chat_response.id.split('-', 1)[-1]}" if "-" in chat_response.id else chat_response.id)
+    )
     return ResponsesResponse(
-        id=f"resp_{chat_response.id.split('-', 1)[-1]}" if "-" in chat_response.id else chat_response.id,
+        id=resolved_response_id,
+        created_at=chat_response.created,
+        status="completed",
         model=model,
         output=output_items,
+        output_text="".join(text_parts),
         usage=ResponsesUsageInfo(
             input_tokens=chat_response.usage.prompt_tokens,
             output_tokens=chat_response.usage.completion_tokens,
@@ -2563,37 +2752,116 @@ def _chat_completion_sse_chunk(
     return f"data: {payload}\n\n"
 
 
+def _append_only_delta(sent: str, full_text: str) -> str:
+    """Return the append-only suffix between streamed snapshots."""
+    if not full_text or full_text == sent:
+        return ""
+    if not sent:
+        return full_text
+    if full_text.startswith(sent):
+        return full_text[len(sent):]
+    # Bytes already sent over SSE cannot be retracted. If the browser rewrote
+    # earlier text, wait for the authoritative final response instead.
+    return ""
+
+
 async def _stream_chat_completion(
     request: ChatCompletionRequest,
     app_key_override: str = "",
     http_request: Request | None = None,
     fresh_thread: bool = False,
 ) -> StreamingResponse:
-    """Return a Chat Completions SSE stream after the browser response completes.
-
-    Browser automation cannot provide token deltas, but IDE clients (OpenCode,
-    Cline, etc.) send stream=true and require text/event-stream. Emit the full
-    assistant message as one or two chunks plus a terminal finish chunk.
-    """
+    """Stream live ChatGPT backend deltas as Chat Completions SSE."""
 
     async def _events():
-        non_stream_request = request.model_copy(update={"stream": False})
-        response = await _execute_chat_completion(
-            non_stream_request,
-            app_key_override=app_key_override,
-            http_request=http_request,
-            fresh_thread=fresh_thread,
+        stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        model_id = _resolve_model_id(request.model)
+        stream_meta = ChatCompletionResponse(
+            id=stream_id,
+            model=model_id,
+            choices=[Choice(message=ChoiceMessage(role="assistant", content=None))],
         )
-        choice = response.choices[0]
-        message = choice.message
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        sent = ""
+        last_keepalive = time.monotonic()
 
+        def on_delta(full_text: str) -> None:
+            try:
+                queue.put_nowait(full_text)
+            except Exception:
+                pass
+
+        # Tool calls are encoded into ordinary assistant JSON by the browser-side
+        # prompt. Streaming that raw JSON as assistant text would corrupt the
+        # protocol, so tool requests keep the live connection warm and emit the
+        # structured tool call once the existing parser has validated it.
+        live_callback = (
+            None
+            if request.tools and request.tool_choice != "none"
+            else on_delta
+        )
+
+        non_stream_request = request.model_copy(update={"stream": False})
+        task = asyncio.create_task(
+            _execute_chat_completion(
+                non_stream_request,
+                app_key_override=app_key_override,
+                http_request=http_request,
+                fresh_thread=fresh_thread,
+                live_stream_callback=live_callback,
+                response_id_override=stream_id,
+            )
+        )
+
+        # First bytes leave immediately, before browser/model latency.
         yield _chat_completion_sse_chunk(
-            response,
+            stream_meta,
             {"role": "assistant", "content": ""},
         )
 
+        try:
+            while not task.done() or not queue.empty():
+                try:
+                    full_text = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if time.monotonic() - last_keepalive >= 5.0:
+                        yield ": keep-alive\n\n"
+                        last_keepalive = time.monotonic()
+                    continue
+
+                delta = _append_only_delta(sent, full_text)
+                if delta:
+                    sent += delta
+                    yield _chat_completion_sse_chunk(
+                        stream_meta,
+                        {"content": delta},
+                    )
+                    last_keepalive = time.monotonic()
+
+            response = await task
+        except Exception as exc:
+            if not task.done():
+                task.cancel()
+            payload = json.dumps(
+                {"error": {"message": str(exc), "type": "server_error"}},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        choice = response.choices[0]
+        message = choice.message
+
         if message.content:
-            yield _chat_completion_sse_chunk(response, {"content": message.content})
+            remainder = _append_only_delta(sent, message.content)
+            if remainder:
+                sent += remainder
+                yield _chat_completion_sse_chunk(
+                    response,
+                    {"content": remainder},
+                )
 
         if message.tool_calls:
             tool_deltas: list[dict[str, Any]] = []
@@ -2635,44 +2903,374 @@ async def _stream_responses(
     http_request: Request | None = None,
     fresh_thread: bool = False,
 ) -> StreamingResponse:
-    """Return a Responses API SSE stream after the browser response completes.
-
-    Browser automation cannot provide token deltas, but some clients (notably chat
-    UIs) send stream=true and require an event-stream response. Emit one full-text
-    delta plus the completed response so those clients can consume the result.
-    """
+    """Stream Responses events with immediate reasoning heartbeat and live text."""
 
     async def _events():
-        response = await _execute_responses(
-            request,
-            app_key_override=app_key_override,
-            http_request=http_request,
-            fresh_thread=fresh_thread,
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        reasoning_id = f"rs_{uuid.uuid4().hex[:24]}"
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        sent = ""
+        sequence = 0
+        reasoning_closed = False
+        message_started = False
+        last_keepalive = time.monotonic()
+
+        def emit(event_type: str, payload: dict[str, Any]) -> str:
+            nonlocal sequence
+            body = {
+                "type": event_type,
+                "sequence_number": sequence,
+                **payload,
+            }
+            sequence += 1
+            return _responses_sse_event(event_type, body)
+
+        def on_delta(full_text: str) -> None:
+            try:
+                queue.put_nowait(full_text)
+            except Exception:
+                pass
+
+        function_tools = _responses_function_tools(request.tools)
+        live_callback = (
+            None
+            if function_tools and request.tool_choice != "none"
+            else on_delta
         )
-        response_dict = _model_dump_compat(response, mode="json")
-        text = ""
+
+        base_response = {
+            "id": response_id,
+            "object": "response",
+            "created": created,
+            "created_at": created,
+            "status": "in_progress",
+            "model": request.model,
+            "output": [],
+            "usage": None,
+        }
+
+        task = asyncio.create_task(
+            _execute_responses(
+                request,
+                app_key_override=app_key_override,
+                http_request=http_request,
+                fresh_thread=fresh_thread,
+                live_stream_callback=live_callback,
+                response_id_override=response_id,
+            )
+        )
+
+        # Send a valid Responses lifecycle immediately. The short reasoning
+        # summary is a connection/status placeholder, not hidden chain-of-thought.
+        yield emit("response.created", {"response": dict(base_response)})
+        yield emit("response.in_progress", {"response": dict(base_response)})
+        yield emit(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {
+                    "id": reasoning_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            },
+        )
+        yield emit(
+            "response.reasoning_summary_part.added",
+            {
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            },
+        )
+        yield emit(
+            "response.reasoning_summary_text.delta",
+            {
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "thinking...",
+            },
+        )
+
+        def close_reasoning_events() -> list[str]:
+            nonlocal reasoning_closed
+            if reasoning_closed:
+                return []
+            reasoning_closed = True
+            summary_part = {"type": "summary_text", "text": "thinking..."}
+            reasoning_item = {
+                "id": reasoning_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [summary_part],
+            }
+            return [
+                emit(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "item_id": reasoning_id,
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "text": "thinking...",
+                    },
+                ),
+                emit(
+                    "response.reasoning_summary_part.done",
+                    {
+                        "item_id": reasoning_id,
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": summary_part,
+                    },
+                ),
+                emit(
+                    "response.output_item.done",
+                    {
+                        "output_index": 0,
+                        "item": reasoning_item,
+                    },
+                ),
+            ]
+
+        def start_message_events() -> list[str]:
+            nonlocal message_started
+            if message_started:
+                return []
+            message_started = True
+            return [
+                emit(
+                    "response.output_item.added",
+                    {
+                        "output_index": 1,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                ),
+                emit(
+                    "response.content_part.added",
+                    {
+                        "item_id": message_id,
+                        "output_index": 1,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                ),
+            ]
+
+        try:
+            while not task.done() or not queue.empty():
+                try:
+                    full_text = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if time.monotonic() - last_keepalive >= 5.0:
+                        yield ": keep-alive\n\n"
+                        last_keepalive = time.monotonic()
+                    continue
+
+                delta = _append_only_delta(sent, full_text)
+                if not delta:
+                    continue
+
+                for event in close_reasoning_events():
+                    yield event
+                for event in start_message_events():
+                    yield event
+
+                sent += delta
+                yield emit(
+                    "response.output_text.delta",
+                    {
+                        "item_id": message_id,
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": delta,
+                    },
+                )
+                last_keepalive = time.monotonic()
+
+            response = await task
+        except Exception as exc:
+            if not task.done():
+                task.cancel()
+            for event in close_reasoning_events():
+                yield event
+            failed_response = {
+                **base_response,
+                "status": "failed",
+                "error": {
+                    "code": "server_error",
+                    "message": str(exc),
+                },
+            }
+            yield emit(
+                "response.failed",
+                {"response": failed_response},
+            )
+            return
+
+        for event in close_reasoning_events():
+            yield event
+
+        final_text = ""
+        tool_items: list[ResponseOutputToolCall] = []
         for item in response.output:
             if isinstance(item, ResponseOutputMessage):
-                text += "".join(part.text for part in item.content)
+                final_text += "".join(part.text for part in item.content)
+            elif isinstance(item, ResponseOutputToolCall):
+                tool_items.append(item)
 
-        if text:
-            yield _responses_sse_event(
-                "response.output_text.delta",
+        if final_text:
+            for event in start_message_events():
+                yield event
+            remainder = _append_only_delta(sent, final_text)
+            if remainder:
+                sent += remainder
+                yield emit(
+                    "response.output_text.delta",
+                    {
+                        "item_id": message_id,
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": remainder,
+                    },
+                )
+
+            yield emit(
+                "response.output_text.done",
                 {
-                    "type": "response.output_text.delta",
-                    "response_id": response.id,
-                    "output_index": 0,
+                    "item_id": message_id,
+                    "output_index": 1,
                     "content_index": 0,
-                    "delta": text,
+                    "text": final_text,
+                },
+            )
+            final_part = {
+                "type": "output_text",
+                "text": final_text,
+                "annotations": [],
+            }
+            yield emit(
+                "response.content_part.done",
+                {
+                    "item_id": message_id,
+                    "output_index": 1,
+                    "content_index": 0,
+                    "part": final_part,
+                },
+            )
+            yield emit(
+                "response.output_item.done",
+                {
+                    "output_index": 1,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [final_part],
+                    },
                 },
             )
 
-        yield _responses_sse_event(
-            "response.completed",
+        next_output_index = 2 if final_text else 1
+        completed_output: list[dict[str, Any]] = [
             {
-                "type": "response.completed",
-                "response": response_dict,
-            },
+                "id": reasoning_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": "thinking..."}],
+            }
+        ]
+        if final_text:
+            completed_output.append(
+                {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": final_text,
+                            "annotations": [],
+                        }
+                    ],
+                }
+            )
+
+        for tool in tool_items:
+            output_index = next_output_index
+            next_output_index += 1
+            call_id = tool.call_id or tool.id
+            function_item_id = tool.id if tool.call_id else f"fc_{uuid.uuid4().hex[:24]}"
+            added_item = {
+                "id": function_item_id,
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": call_id,
+                "name": tool.name,
+                "arguments": "",
+            }
+            yield emit(
+                "response.output_item.added",
+                {"output_index": output_index, "item": added_item},
+            )
+            if tool.arguments:
+                yield emit(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": function_item_id,
+                        "output_index": output_index,
+                        "delta": tool.arguments,
+                    },
+                )
+            yield emit(
+                "response.function_call_arguments.done",
+                {
+                    "item_id": function_item_id,
+                    "output_index": output_index,
+                    "name": tool.name,
+                    "arguments": tool.arguments,
+                },
+            )
+            done_item = {
+                **added_item,
+                "status": "completed",
+                "arguments": tool.arguments,
+            }
+            yield emit(
+                "response.output_item.done",
+                {"output_index": output_index, "item": done_item},
+            )
+            completed_output.append(done_item)
+
+        response_dict = _model_dump_compat(response, mode="json")
+        response_dict.update(
+            {
+                "id": response_id,
+                "created_at": response_dict.get("created", created),
+                "status": "completed",
+                "output": completed_output,
+                "output_text": final_text,
+            }
+        )
+        yield emit(
+            "response.completed",
+            {"response": response_dict},
         )
         yield "data: [DONE]\n\n"
 
@@ -2681,6 +3279,7 @@ async def _stream_responses(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
@@ -2831,6 +3430,8 @@ async def _execute_responses(
     app_key_override: str = "",
     http_request: Request | None = None,
     fresh_thread: bool = False,
+    live_stream_callback: Callable[[str], Any] | None = None,
+    response_id_override: str | None = None,
 ) -> ResponsesResponse:
     """Shared executor for Responses API requests.
 
@@ -2861,7 +3462,13 @@ async def _execute_responses(
             conversation_id = f"response-branch:{request.previous_response_id}:{uuid.uuid4().hex[:12]}"
             seed_transcript = previous.transcript
     if not conversation_id:
-        conversation_id = f"response-chain:{uuid.uuid4().hex}"
+        if request.store is False and _responses_has_stable_session(http_request):
+            # Codex HTTP sends store=false but a stable session-id. Keep this
+            # request out of the durable SQLite response-chain store and let
+            # _tab_session_key/app-thread routing reuse the existing browser tab.
+            conversation_id = ""
+        else:
+            conversation_id = f"response-chain:{uuid.uuid4().hex}"
 
     chat_request = _responses_request_to_chat_request(request, conversation_id=conversation_id)
     chat_request.stream = False
@@ -2872,8 +3479,13 @@ async def _execute_responses(
         seed_transcript=seed_transcript,
         capture_route_outcome=True,
         fresh_thread=fresh_thread,
+        live_stream_callback=live_stream_callback,
     )
-    response = _responses_response_from_chat(chat_response, request.model)
+    response = _responses_response_from_chat(
+        chat_response,
+        request.model,
+        response_id=response_id_override,
+    )
     route = _completion_route_outcomes.pop(chat_response.id, None)
     if route is not None and request.store is not False:
         _get_conversation_store().save_response(response.id, route)
@@ -2888,6 +3500,8 @@ async def _execute_chat_completion(
     seed_transcript: tuple[dict[str, Any], ...] | None = None,
     capture_route_outcome: bool = False,
     fresh_thread: bool = False,
+    live_stream_callback: Callable[[str], Any] | None = None,
+    response_id_override: str | None = None,
 ) -> ChatCompletionResponse:
     """Shared sync/async executor for chat completions."""
     client = _get_client()
@@ -2912,6 +3526,7 @@ async def _execute_chat_completion(
 
     # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
+    prompt_prefix_path: str | None = None
 
     try:
         async with acquire_browser_page(session_key) as lease:
@@ -2924,7 +3539,7 @@ async def _execute_chat_completion(
             routing_action = "reuse-current"
             continuing_thread = False
             app_thread_created_by_catgpt = False
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 log.info("OpenAI app-thread key: %s", app_key)
 
             if fresh_thread:
@@ -2959,6 +3574,14 @@ async def _execute_chat_completion(
                     conversation_key,
                     routing_action,
                 )
+            elif session_key:
+                if lease.is_first_turn:
+                    log.info("OpenAI session route: starting a fresh ChatGPT thread for %s", session_key)
+                    await client.new_chat()
+                    routing_action = "new-chat-session"
+                else:
+                    routing_action = "persistent-session"
+                    continuing_thread = True
             elif Config.API_APP_THREAD_MODE and app_key:
                 now_app = time.time()
                 mapped_thread = ""
@@ -2986,9 +3609,6 @@ async def _execute_chat_completion(
                     await client.new_chat()
                     routing_action = "new-chat-for-app"
                     app_thread_created_by_catgpt = True
-            elif session_key and not lease.is_first_turn:
-                routing_action = "persistent-session"
-                continuing_thread = True
             elif Config.uses_browser():
                 log.info("No session identity: starting a fresh ChatGPT thread")
                 await client.new_chat()
@@ -3053,9 +3673,9 @@ async def _execute_chat_completion(
             # -- Build the prompt --------------------------------
             messages = list(request.messages)
 
-            # Tool definitions are request-scoped. Attach them to the latest
-            # user turn so sticky browser conversations receive the current
-            # catalog even when older history is pruned.
+            # Tool definitions are request-scoped. Build the exact legacy prompt
+            # first; ChatGPT externalizes everything before Latest request to transform
+            # only after system messages and other request context have been flattened.
             if request.tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
                 if tool_system:
@@ -3171,6 +3791,29 @@ async def _execute_chat_completion(
                 prompt = f"{attachment_prefix}{prompt}" if prompt else attachment_prefix.strip()
                 full_prompt = f"{attachment_prefix}{full_prompt}" if full_prompt else attachment_prefix.strip()
 
+            # Work-style tool prompts use "Latest request to transform:" while
+            # Codex-style prompts use "User prompt:". Both formats externalize the
+            # complete prefix into one Markdown attachment and leave the request itself
+            # in the browser composer. If a wrapper ever introduces both, the last
+            # marker remains the safest request boundary.
+            request_marker = _find_request_marker(full_prompt)
+            if isinstance(client, ChatGPTClient) and request_marker is not None:
+                marker_index, marker_text = request_marker
+                externalized_prefix = full_prompt[:marker_index].rstrip()
+                if externalized_prefix:
+                    prompt_prefix_path = _create_prompt_prefix_attachment(externalized_prefix)
+                    file_paths.append(prompt_prefix_path)
+                    attachment_name = os.path.basename(prompt_prefix_path)
+                    full_prompt = _externalize_latest_request_prefix(full_prompt, attachment_name)
+                    if _find_request_marker(prompt) is not None:
+                        prompt = _externalize_latest_request_prefix(prompt, attachment_name)
+                    log.info(
+                        "Externalized pre-request context to Markdown at %r: %s (%d chars removed from composer)",
+                        marker_text.strip(),
+                        attachment_name,
+                        len(externalized_prefix),
+                    )
+
             cache_key = _cache_key_for_request_with_app(request, app_key)
             stateful_request = bool(
                 fresh_thread
@@ -3186,7 +3829,10 @@ async def _execute_chat_completion(
                     cached_entry = _response_cache.get(cache_key)
                     if cached_entry and now - cached_entry[0] <= _CACHE_TTL_SECONDS:
                         log.info("Response cache hit: returning cached completion")
-                        return _clone_cached_response(cached_entry[1])
+                        cached = _clone_cached_response(cached_entry[1])
+                        if response_id_override:
+                            cached.id = response_id_override
+                        return cached
 
             # -- Send to ChatGPT --------------------------------
             try:
@@ -3203,6 +3849,8 @@ async def _execute_chat_completion(
                 }
                 if Config.uses_browser():
                     send_kwargs["read_aloud"] = bool(request.read_aloud)
+                    if isinstance(client, ChatGPTClient) and live_stream_callback is not None:
+                        send_kwargs["on_delta"] = live_stream_callback
                 else:
                     send_kwargs["stateless"] = True
                 result = await client.send_message(prompt, **send_kwargs)
@@ -3226,7 +3874,7 @@ async def _execute_chat_completion(
                         if user_text:
                             _thread_last_user_text[thread_for_contract] = (time.time(), user_text)
 
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -3370,6 +4018,7 @@ async def _execute_chat_completion(
             completion_tokens = _estimate_tokens(response_text or "")
 
             response = ChatCompletionResponse(
+                id=response_id_override or f"chatcmpl-{uuid.uuid4().hex[:24]}",
                 model=model_id,
                 choices=[
                     Choice(
@@ -3433,6 +4082,17 @@ async def _execute_chat_completion(
 
             return response
     finally:
+        if prompt_prefix_path:
+            try:
+                os.unlink(prompt_prefix_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.debug(
+                    "Could not remove temporary prompt-prefix attachment %s: %s",
+                    prompt_prefix_path,
+                    exc,
+                )
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import types
 import unittest
@@ -51,6 +52,12 @@ if "playwright_stealth" not in sys.modules and importlib.util.find_spec("playwri
 from src.api.openai_routes import (
     _anthropic_messages_to_chat_request,
     _apply_tool_prompt_to_messages,
+    _build_prompt,
+    _create_prompt_prefix_attachment,
+    _externalize_latest_request_prefix,
+    _find_request_marker,
+    _LATEST_REQUEST_MARKER,
+    _USER_PROMPT_MARKER,
     _build_page_extraction_note,
     _build_page_extraction_response_format,
     _build_tool_system_prompt,
@@ -75,6 +82,7 @@ from src.api.openai_routes import (
     _validate_responses_request,
 )
 from src.api.browser_gate import browser_access_lock
+from src.chatgpt.client import ChatGPTClient
 from src.api import routes as native_routes
 from src.api import openai_routes as openai_routes_module
 from src.api.attachment_expander import AttachmentPageDescriptor
@@ -89,6 +97,7 @@ from src.api.openai_schemas import (
     ChoiceMessage,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseOutputToolCall,
     ResponsesUsageInfo,
     ToolCall,
     ToolDefinition,
@@ -127,6 +136,16 @@ async def _collect_stream(stream_response) -> list[bytes]:
 
 
 class OpenAIRoutesHelpersTests(unittest.TestCase):
+    def test_generic_long_prompt_attachment_is_lossless_markdown(self) -> None:
+        text = "# Long request\n\nKeep *all* punctuation exactly.\n中文也要保留。\n"
+        path = ChatGPTClient._create_prompt_attachment(text)
+        try:
+            self.assertTrue(path.endswith(".md"))
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), text)
+        finally:
+            os.unlink(path)
+
     def test_fresh_thread_header_validation(self) -> None:
         self.assertTrue(_fresh_thread_from_header(_make_request({"x-catgpt-thread-mode": "fresh"})))
         self.assertFalse(_fresh_thread_from_header(_make_request()))
@@ -141,6 +160,115 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaises(HTTPException):
                 _validate_chat_request(request, fresh_thread=True)
+
+    def test_externalized_prefix_moves_system_and_tool_schema_out_of_composer(self) -> None:
+        tools = [
+            ToolDefinition(
+                function=FunctionDefinition(
+                    name="shell",
+                    description="Run a shell command",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                    },
+                )
+            )
+        ]
+        tool_prompt = _build_tool_system_prompt(tools, "auto")
+        messages = [
+            ChatMessage(role="system", content="SYSTEM-CONTEXT-SENTINEL"),
+            ChatMessage(role="user", content="print python version"),
+        ]
+        messages = _apply_tool_prompt_to_messages(messages, tool_prompt)
+        full_prompt = _build_prompt(messages)
+
+        marker_index = full_prompt.index(_LATEST_REQUEST_MARKER)
+        prefix = full_prompt[:marker_index].rstrip()
+        path = _create_prompt_prefix_attachment(prefix)
+        try:
+            compact = _externalize_latest_request_prefix(
+                full_prompt,
+                os.path.basename(path),
+            )
+            with open(path, "r", encoding="utf-8") as handle:
+                attachment = handle.read()
+
+            self.assertIn("SYSTEM-CONTEXT-SENTINEL", attachment)
+            self.assertIn('"name": "shell"', attachment)
+            self.assertIn("Record definitions:", attachment)
+            self.assertNotIn("SYSTEM-CONTEXT-SENTINEL", compact)
+            self.assertNotIn('"name": "shell"', compact)
+            self.assertIn("Read the attached Markdown file", compact)
+            self.assertIn(_LATEST_REQUEST_MARKER, compact)
+            self.assertTrue(compact.endswith("print python version"))
+        finally:
+            os.unlink(path)
+
+    def test_work_marker_externalizes_prefix(self) -> None:
+        prompt = (
+            "SYSTEM AND TOOL CONTEXT\n"
+            + ("W" * 4096)
+            + "\n"
+            + _LATEST_REQUEST_MARKER
+            + "work request"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertIsNotNone(marker)
+        assert marker is not None
+        self.assertTrue(marker[1].startswith("Latest request to transform:"))
+
+        compact = _externalize_latest_request_prefix(prompt, "context.md")
+        self.assertNotIn("SYSTEM AND TOOL CONTEXT", compact)
+        self.assertIn(_LATEST_REQUEST_MARKER, compact)
+        self.assertTrue(compact.endswith("work request"))
+
+    def test_codex_user_prompt_marker_externalizes_prefix(self) -> None:
+        prompt = (
+            "CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT\n"
+            + ("C" * 4096)
+            + "\n"
+            + _USER_PROMPT_MARKER
+            + "\n"
+            + "codex request"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertIsNotNone(marker)
+        assert marker is not None
+        self.assertTrue(marker[1].startswith("User prompt:"))
+
+        prefix = prompt[: marker[0]].rstrip()
+        path = _create_prompt_prefix_attachment(prefix)
+        try:
+            compact = _externalize_latest_request_prefix(
+                prompt,
+                os.path.basename(path),
+            )
+            with open(path, "r", encoding="utf-8") as handle:
+                attachment = handle.read()
+
+            self.assertIn("CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT", attachment)
+            self.assertNotIn("CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT", compact)
+            self.assertIn("User prompt:", compact)
+            self.assertTrue(compact.endswith("codex request"))
+        finally:
+            os.unlink(path)
+
+    def test_request_marker_lookup_uses_last_occurrence_anywhere(self) -> None:
+        prompt = (
+            "prefix User prompt:\nfirst "
+            "middle Latest request to transform:\nsecond"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertEqual(
+            marker,
+            (
+                prompt.rfind("Latest request to transform:"),
+                "Latest request to transform:",
+            ),
+        )
 
     def test_tool_prompt_honors_none_required_and_specific_choices(self) -> None:
         tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
@@ -537,6 +665,101 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(messages[0].content[0]["type"], "text")
         self.assertEqual(messages[0].content[0]["text"], "Hello")
 
+    def test_responses_input_skips_reasoning_and_normalizes_output_text(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking..."}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Previous answer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Next turn"}],
+                },
+            ],
+        )
+
+        messages = _responses_input_to_messages(req.input)
+
+        self.assertEqual([message.role for message in messages], ["assistant", "user"])
+        assert isinstance(messages[0].content, list)
+        self.assertEqual(messages[0].content[0], {"type": "text", "text": "Previous answer"})
+        assert isinstance(messages[1].content, list)
+        self.assertEqual(messages[1].content[0], {"type": "text", "text": "Next turn"})
+
+    def test_store_false_responses_with_session_header_reuse_browser_session(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            captured["conversation_id"] = request.conversation_id
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Hello",
+                store=False,
+            )
+            asyncio.run(
+                openai_routes_module._execute_responses(
+                    req,
+                    http_request=_make_request({"session-id": "codex-session-123"}),
+                )
+            )
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        # No synthetic response-chain id means _execute_chat_completion can use
+        # the stable session header/app routing instead of forcing new_chat().
+        self.assertIsNone(captured["conversation_id"])
+
+    def test_store_false_responses_without_session_remain_stateless(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            captured["conversation_id"] = request.conversation_id
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Hello",
+                store=False,
+            )
+            asyncio.run(openai_routes_module._execute_responses(req))
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        conversation_id = captured["conversation_id"]
+        self.assertIsNotNone(conversation_id)
+        assert conversation_id is not None
+        self.assertTrue(conversation_id.startswith("response-chain:"))
+
     def test_responses_request_to_chat_request_basic(self) -> None:
         """ResponsesRequest translates to ChatCompletionRequest."""
         req = ResponsesRequest(
@@ -577,7 +800,7 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(chat_req.reasoning_effort, "high")
 
     def test_validate_chat_request_accepts_stream(self) -> None:
-        """Stream=true is allowed; route handlers emit pseudo-SSE after completion."""
+        """Stream=true is allowed; ChatGPT can forward live backend SSE deltas."""
         req = ChatCompletionRequest(
             model="catgpt-browser",
             messages=[ChatMessage(role="user", content="hello")],
@@ -654,7 +877,8 @@ class ResponsesAPITests(unittest.TestCase):
         )
         resp = _responses_response_from_chat(chat_response, "catgpt-browser")
         self.assertEqual(len(resp.output), 2)
-        self.assertEqual(resp.output[1].type, "tool_call")
+        self.assertEqual(resp.output[1].type, "function_call")
+        self.assertEqual(resp.output[1].call_id, "call_123")
 
     def test_execute_responses_forwards_app_key_override(self) -> None:
         """Responses execution preserves app-scoped routing keys."""
@@ -729,6 +953,270 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertIn(b"chat.completion.chunk", body)
         self.assertIn(b"[DONE]", body)
 
+    def test_chat_stream_forwards_live_backend_deltas(self) -> None:
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            live_stream_callback=None,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            if live_stream_callback is not None:
+                live_stream_callback("Hel")
+                await asyncio.sleep(0)
+                live_stream_callback("Hello")
+            return ChatCompletionResponse(
+                id=response_id_override or "chatcmpl-test",
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="Hello"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ChatCompletionRequest(
+                model="catgpt-browser",
+                messages=[ChatMessage(role="user", content="Hello")],
+                stream=True,
+            )
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_chat_completion(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        self.assertIn(b'\"content\":\"Hel\"', body)
+        self.assertIn(b'\"content\":\"lo\"', body)
+        self.assertNotIn(b'\"content\":\"Hello\"', body)
+
+    def test_responses_stream_starts_with_thinking_before_provider_finishes(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            await asyncio.sleep(0.2)
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(
+                        content=[ResponseOutputText(text="done")]
+                    )
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _first_chunk() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                iterator = stream_response.body_iterator.__aiter__()
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.05)
+                if hasattr(iterator, "aclose"):
+                    await iterator.aclose()
+                return chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+
+            first = asyncio.run(_first_chunk())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.created", first)
+
+    def test_responses_accepts_flat_function_and_builtin_tools(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input="hello",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object"},
+                },
+                {"type": "web_search", "external_web_access": False},
+            ],
+            tool_choice={"type": "function", "name": "shell"},
+        )
+
+        converted = _responses_request_to_chat_request(req)
+
+        self.assertEqual(len(converted.tools or []), 1)
+        self.assertEqual(converted.tools[0].function.name, "shell")
+        self.assertEqual(
+            converted.tool_choice,
+            {"type": "function", "function": {"name": "shell"}},
+        )
+
+    def test_responses_function_call_input_round_trip(self) -> None:
+        req = ResponsesRequest(
+            model="catgpt-browser",
+            input=[
+                {"role": "user", "content": "Run echo hello"},
+                {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": '{"command":["echo","hello"]}',
+                    "call_id": "call_123",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "hello",
+                },
+            ],
+        )
+
+        messages = _responses_input_to_messages(req.input)
+
+        self.assertEqual([m.role for m in messages], ["user", "assistant", "tool"])
+        self.assertEqual(messages[1].tool_calls[0].id, "call_123")
+        self.assertEqual(messages[1].tool_calls[0].function.name, "shell")
+        self.assertEqual(messages[2].tool_call_id, "call_123")
+        self.assertEqual(messages[2].content, "hello")
+
+    def test_responses_function_call_output_shape(self) -> None:
+        chat_response = ChatCompletionResponse(
+            model="catgpt-browser",
+            choices=[
+                Choice(
+                    message=ChoiceMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id="call_123",
+                                function=FunctionCallInfo(
+                                    name="shell",
+                                    arguments='{"command":["pwd"]}',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=UsageInfo(input_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        response = _responses_response_from_chat(chat_response, "catgpt-browser")
+
+        self.assertEqual(response.status, "completed")
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(len(response.output), 1)
+        self.assertEqual(response.output[0].type, "function_call")
+        self.assertEqual(response.output[0].call_id, "call_123")
+        self.assertEqual(response.output[0].name, "shell")
+
+    def test_responses_stream_emits_thinking_live_text_and_completed(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            live_stream_callback=None,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            if live_stream_callback is not None:
+                live_stream_callback("Hel")
+                await asyncio.sleep(0)
+                live_stream_callback("Hello")
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(
+                        content=[ResponseOutputText(text="Hello")]
+                    )
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.reasoning_summary_text.delta", body)
+        self.assertIn(b"thinking...", body)
+        self.assertIn(b'\"delta\":\"Hel\"', body)
+        self.assertIn(b'\"delta\":\"lo\"', body)
+        self.assertIn(b"response.completed", body)
+
+    def test_responses_stream_emits_response_failed_on_executor_error(self) -> None:
+        async def fake_execute_responses(*_args, **_kwargs):
+            raise RuntimeError("attachment upload failed")
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.failed", body)
+        self.assertIn(b"attachment upload failed", body)
+        self.assertNotIn(b'data: [DONE]', body)
+
+    def test_responses_stream_emits_function_call_events(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(content=[ResponseOutputText(text="")]),
+                    ResponseOutputToolCall(
+                        id="call_123",
+                        name="shell",
+                        arguments='{"command":"python --version"}',
+                    ),
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Check Python",
+                stream=True,
+            )
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.function_call_arguments.delta", body)
+        self.assertIn(b"response.function_call_arguments.done", body)
+        self.assertIn(b'\"type\":\"function_call\"', body)
+        self.assertIn(b'\"call_id\":\"call_123\"', body)
+
     def test_execute_responses_accepts_streaming_clients_without_streaming_browser(self) -> None:
         """Responses stream requests are executed as non-stream browser calls."""
         captured: dict[str, bool] = {}
@@ -785,14 +1273,32 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual([m.role for m in pruned], ["system", "user", "tool"])
         self.assertEqual(pruned[1].content, "second")
 
-    def test_tab_session_key_prefers_session_header(self) -> None:
+    def test_tab_session_key_uses_header_identity(self) -> None:
         req = ChatCompletionRequest(
             messages=[ChatMessage(role="user", content="hello")],
             user="alice",
             thread_id="thread-1",
         )
         http_req = _make_request({"x-session-id": "sess-9"})
-        self.assertEqual(_tab_session_key(req, http_req, app_key="user:alice"), "sess-9")
+        self.assertEqual(
+            _tab_session_key(req, http_req, app_key="user:alice"),
+            "x-session-id:sess-9",
+        )
+
+    def test_tab_session_key_prefers_codex_thread_id(self) -> None:
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+        http_req = _make_request(
+            {
+                "thread-id": "codex-thread-1",
+                "session-id": "codex-session-1",
+            }
+        )
+        self.assertEqual(
+            _tab_session_key(req, http_req),
+            "thread-id:codex-thread-1",
+        )
 
     def test_tab_session_key_falls_back_to_app_key(self) -> None:
         req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])

@@ -58,7 +58,7 @@ CatGPT turns a logged-in browser session into familiar API endpoints. ChatGPT, C
 </table>
 
 > [!TIP]
-> Long-prompt fallback is enabled by default. If ChatGPT disables direct submission, CatGPT uploads the complete request as a temporary UTF-8 attachment. The flow has been validated with a 1.4-million-character request.
+> Long-prompt fallback is enabled by default. If ChatGPT disables direct submission, CatGPT uploads the complete request losslessly as a temporary UTF-8 Markdown attachment. The flow has been validated with a 1.4-million-character request.
 
 ## Fork vs Upstream
 
@@ -155,7 +155,10 @@ Use `/{app_name}/v1/...` or `/{app_name}/api/...` routes to isolate applications
 In Cline, choose **OpenAI Compatible**, set Base URL to `http://localhost:8650/cline/v1`, API Key to `CATGPT_API_KEY`, and Model ID to `catgpt-browser` (or `claude-browser` / `gemini-browser`).
 
 > [!NOTE]
-> `stream=true` is protocol-compatible, but browser generation finishes before CatGPT emits the SSE or NDJSON response chunks. It is not live token forwarding from the provider.
+> For the ChatGPT browser provider, `stream=true` now forwards live user-facing text from ChatGPT's own `/backend-api/conversation` SSE stream. Responses streams open immediately with a short `thinking...` reasoning-summary status item and periodic keep-alive comments while the model is still reasoning. Tool calls are still validated by CatGPT's existing structured parser and are emitted as function-call events once the tool payload is complete. Other browser providers retain completion-then-stream compatibility behavior.
+
+> [!TIP]
+> On ChatGPT tool/function requests, CatGPT externalizes everything before `Latest request to transform:` into a temporary Markdown attachment. The browser composer receives only a short attachment pointer plus the latest request, avoiding very large first-turn Codex system/tool prompts while preserving the complete original context in the uploaded file.
 
 ## Essential Configuration
 
