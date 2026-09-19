@@ -4031,6 +4031,17 @@ async def _execute_chat_completion(
 
             return response
     finally:
+        if prompt_prefix_path:
+            try:
+                os.unlink(prompt_prefix_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.debug(
+                    "Could not remove temporary prompt-prefix attachment %s: %s",
+                    prompt_prefix_path,
+                    exc,
+                )
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
