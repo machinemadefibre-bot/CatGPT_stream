@@ -43,6 +43,15 @@ def _resolve_domains_for_chrome() -> str:
 
     Returns empty string if all resolutions fail.
     """
+    # A configured browser proxy should resolve target hostnames itself.
+    # Pre-resolving on the Docker host would pin ChatGPT/Claude/Gemini to an
+    # edge selected from the host region, then send that IP through the proxy
+    # exit region (for example SG -> AU -> SG), adding latency and leaking the
+    # host resolver's location into routing.
+    if os.environ.get("BROWSER_PROXY_SERVER", "").strip():
+        log.info("Browser proxy configured; skipping local provider-domain pre-resolution")
+        return ""
+
     # Only needed in Docker (check for /.dockerenv or DISPLAY=:99).
     if not _is_docker_runtime():
         return ""
