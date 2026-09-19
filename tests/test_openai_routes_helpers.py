@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import types
 import unittest
@@ -51,6 +52,10 @@ if "playwright_stealth" not in sys.modules and importlib.util.find_spec("playwri
 from src.api.openai_routes import (
     _anthropic_messages_to_chat_request,
     _apply_tool_prompt_to_messages,
+    _build_prompt,
+    _create_prompt_prefix_attachment,
+    _externalize_latest_request_prefix,
+    _LATEST_REQUEST_MARKER,
     _build_page_extraction_note,
     _build_page_extraction_response_format,
     _build_tool_system_prompt,
@@ -142,6 +147,52 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaises(HTTPException):
                 _validate_chat_request(request, fresh_thread=True)
+
+    def test_externalized_prefix_moves_system_and_tool_schema_out_of_composer(self) -> None:
+        tools = [
+            ToolDefinition(
+                function=FunctionDefinition(
+                    name="shell",
+                    description="Run a shell command",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                    },
+                )
+            )
+        ]
+        tool_prompt = _build_tool_system_prompt(tools, "auto")
+        messages = [
+            ChatMessage(role="system", content="SYSTEM-CONTEXT-SENTINEL"),
+            ChatMessage(role="user", content="print python version"),
+        ]
+        messages = _apply_tool_prompt_to_messages(messages, tool_prompt)
+        full_prompt = _build_prompt(messages)
+
+        marker_index = full_prompt.index(_LATEST_REQUEST_MARKER)
+        prefix = full_prompt[:marker_index].rstrip()
+        path = _create_prompt_prefix_attachment(prefix)
+        try:
+            compact = _externalize_latest_request_prefix(
+                full_prompt,
+                os.path.basename(path),
+            )
+            with open(path, "r", encoding="utf-8") as handle:
+                attachment = handle.read()
+
+            self.assertIn("SYSTEM-CONTEXT-SENTINEL", attachment)
+            self.assertIn('"name": "shell"', attachment)
+            self.assertIn("Record definitions:", attachment)
+            self.assertNotIn("SYSTEM-CONTEXT-SENTINEL", compact)
+            self.assertNotIn('"name": "shell"', compact)
+            self.assertIn("Read the attached Markdown file", compact)
+            self.assertIn(_LATEST_REQUEST_MARKER, compact)
+            self.assertTrue(compact.endswith("print python version"))
+        finally:
+            os.unlink(path)
 
     def test_tool_prompt_honors_none_required_and_specific_choices(self) -> None:
         tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
