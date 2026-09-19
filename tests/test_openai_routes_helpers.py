@@ -55,7 +55,9 @@ from src.api.openai_routes import (
     _build_prompt,
     _create_prompt_prefix_attachment,
     _externalize_latest_request_prefix,
+    _find_request_marker,
     _LATEST_REQUEST_MARKER,
+    _USER_PROMPT_MARKER,
     _build_page_extraction_note,
     _build_page_extraction_response_format,
     _build_tool_system_prompt,
@@ -202,6 +204,55 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
             self.assertIn("Read the attached Markdown file", compact)
             self.assertIn(_LATEST_REQUEST_MARKER, compact)
             self.assertTrue(compact.endswith("print python version"))
+        finally:
+            os.unlink(path)
+
+    def test_work_marker_externalizes_prefix(self) -> None:
+        prompt = (
+            "SYSTEM AND TOOL CONTEXT\n"
+            + ("W" * 4096)
+            + "\n"
+            + _LATEST_REQUEST_MARKER
+            + "work request"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertIsNotNone(marker)
+        assert marker is not None
+        self.assertTrue(marker[1].startswith("Latest request to transform:"))
+
+        compact = _externalize_latest_request_prefix(prompt, "context.md")
+        self.assertNotIn("SYSTEM AND TOOL CONTEXT", compact)
+        self.assertIn(_LATEST_REQUEST_MARKER, compact)
+        self.assertTrue(compact.endswith("work request"))
+
+    def test_codex_user_prompt_marker_externalizes_prefix(self) -> None:
+        prompt = (
+            "CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT\n"
+            + ("C" * 4096)
+            + "\n"
+            + _USER_PROMPT_MARKER
+            + "\n"
+            + "codex request"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertIsNotNone(marker)
+        assert marker is not None
+        self.assertTrue(marker[1].startswith("User prompt:"))
+
+        prefix = prompt[: marker[0]].rstrip()
+        path = _create_prompt_prefix_attachment(prefix)
+        try:
+            compact = _externalize_latest_request_prefix(
+                prompt,
+                os.path.basename(path),
+            )
+            with open(path, "r", encoding="utf-8") as handle:
+                attachment = handle.read()
+
+            self.assertIn("CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT", attachment)
+            self.assertNotIn("CODEX SYSTEM / TOOLS / DEVELOPER CONTEXT", compact)
+            self.assertIn("User prompt:", compact)
+            self.assertTrue(compact.endswith("codex request"))
         finally:
             os.unlink(path)
 
