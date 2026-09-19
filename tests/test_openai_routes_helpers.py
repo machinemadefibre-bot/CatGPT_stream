@@ -1154,6 +1154,27 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertIn(b'\"delta\":\"lo\"', body)
         self.assertIn(b"response.completed", body)
 
+    def test_responses_stream_emits_response_failed_on_executor_error(self) -> None:
+        async def fake_execute_responses(*_args, **_kwargs):
+            raise RuntimeError("attachment upload failed")
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.failed", body)
+        self.assertIn(b"attachment upload failed", body)
+        self.assertNotIn(b'data: [DONE]', body)
+
     def test_responses_stream_emits_function_call_events(self) -> None:
         async def fake_execute_responses(
             request: ResponsesRequest,
@@ -1252,14 +1273,32 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual([m.role for m in pruned], ["system", "user", "tool"])
         self.assertEqual(pruned[1].content, "second")
 
-    def test_tab_session_key_prefers_session_header(self) -> None:
+    def test_tab_session_key_uses_header_identity(self) -> None:
         req = ChatCompletionRequest(
             messages=[ChatMessage(role="user", content="hello")],
             user="alice",
             thread_id="thread-1",
         )
         http_req = _make_request({"x-session-id": "sess-9"})
-        self.assertEqual(_tab_session_key(req, http_req, app_key="user:alice"), "sess-9")
+        self.assertEqual(
+            _tab_session_key(req, http_req, app_key="user:alice"),
+            "x-session-id:sess-9",
+        )
+
+    def test_tab_session_key_prefers_codex_thread_id(self) -> None:
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+        http_req = _make_request(
+            {
+                "thread-id": "codex-thread-1",
+                "session-id": "codex-session-1",
+            }
+        )
+        self.assertEqual(
+            _tab_session_key(req, http_req),
+            "thread-id:codex-thread-1",
+        )
 
     def test_tab_session_key_falls_back_to_app_key(self) -> None:
         req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])
