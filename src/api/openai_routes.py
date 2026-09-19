@@ -1074,19 +1074,21 @@ Rules:
 """
 
 
-def _create_tool_contract_attachment(tool_prompt: str) -> str:
-    """Write the large tool contract to a temporary Markdown attachment."""
-    digest = hashlib.sha256(tool_prompt.encode("utf-8")).hexdigest()[:12]
+_LATEST_REQUEST_MARKER = "Latest request to transform:\n"
+
+
+def _create_prompt_prefix_attachment(prefix: str) -> str:
+    """Persist everything before the latest-request marker as Markdown."""
+    digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12]
     fd, filename = tempfile.mkstemp(
-        prefix=f"catgpt-tool-contract-{digest}-",
+        prefix=f"catgpt-request-context-{digest}-",
         suffix=".md",
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write("# Tool contract for this turn\n\n")
-            handle.write(tool_prompt)
-            if not tool_prompt.endswith("\n"):
-                handle.write("\n")
+            handle.write("# Context and tool contract for this turn\n\n")
+            handle.write(prefix.rstrip())
+            handle.write("\n")
     except Exception:
         try:
             os.close(fd)
@@ -1100,17 +1102,21 @@ def _create_tool_contract_attachment(tool_prompt: str) -> str:
     return filename
 
 
-def _apply_tool_attachment_to_messages(
-    messages: list[ChatMessage],
+def _externalize_latest_request_prefix(
+    prompt: str,
     attachment_name: str,
-) -> list[ChatMessage]:
-    """Reference an attached tool contract instead of inlining all schemas."""
-    short_instruction = (
-        f"Read the attached Markdown file `{attachment_name}` as the authoritative "
-        "tool contract for this turn. Apply its record definitions and rules exactly; "
-        "do not summarize or ignore the attachment."
+) -> str:
+    """Replace all text before Latest request to transform with one file pointer."""
+    marker_index = prompt.find(_LATEST_REQUEST_MARKER)
+    if marker_index < 0:
+        return prompt
+    latest_request = prompt[marker_index + len(_LATEST_REQUEST_MARKER):]
+    return (
+        f"Read the attached Markdown file `{attachment_name}` first. It contains "
+        "all context, system instructions, tool definitions, and rules that originally "
+        "preceded the latest-request marker for this turn. Apply that file exactly.\n\n"
+        f"{_LATEST_REQUEST_MARKER}{latest_request}"
     )
-    return _apply_tool_prompt_to_messages(messages, short_instruction)
 
 
 def _apply_tool_prompt_to_messages(
@@ -2131,13 +2137,13 @@ async def _execute_image_generation(
 
             return ImagesResponse(data=image_data_list)
     finally:
-        if tool_contract_path:
+        if prompt_prefix_path:
             try:
-                os.unlink(tool_contract_path)
+                os.unlink(prompt_prefix_path)
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                log.debug("Could not remove temporary tool contract %s: %s", tool_contract_path, exc)
+                log.debug("Could not remove temporary prompt-prefix attachment %s: %s", prompt_prefix_path, exc)
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
@@ -3472,7 +3478,7 @@ async def _execute_chat_completion(
 
     # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
-    tool_contract_path: str | None = None
+    prompt_prefix_path: str | None = None
 
     try:
         async with acquire_browser_page(session_key) as lease:
@@ -3614,27 +3620,13 @@ async def _execute_chat_completion(
             # -- Build the prompt --------------------------------
             messages = list(request.messages)
 
-            # Tool definitions are request-scoped. For ChatGPT, keep the huge
-            # schema/rules block out of the composer by uploading it as Markdown;
-            # the typed prompt contains only a short pointer plus the latest request.
-            # Other providers retain the existing inline behavior.
+            # Tool definitions are request-scoped. Build the exact legacy prompt
+            # first; ChatGPT externalizes everything before Latest request to transform
+            # only after system messages and other request context have been flattened.
             if request.tools and request.tool_choice != "none":
                 tool_system = _build_tool_system_prompt(request.tools, request.tool_choice)
                 if tool_system:
-                    if isinstance(client, ChatGPTClient):
-                        tool_contract_path = _create_tool_contract_attachment(tool_system)
-                        file_paths.append(tool_contract_path)
-                        messages = _apply_tool_attachment_to_messages(
-                            messages,
-                            os.path.basename(tool_contract_path),
-                        )
-                        log.info(
-                            "Tool contract moved to Markdown attachment: %s (%d chars)",
-                            os.path.basename(tool_contract_path),
-                            len(tool_system),
-                        )
-                    else:
-                        messages = _apply_tool_prompt_to_messages(messages, tool_system)
+                    messages = _apply_tool_prompt_to_messages(messages, tool_system)
 
             # If structured output is requested, force strict JSON response
             response_format_system = _build_response_format_system_prompt(effective_response_format)
@@ -3745,6 +3737,31 @@ async def _execute_chat_completion(
             if attachment_prefix:
                 prompt = f"{attachment_prefix}{prompt}" if prompt else attachment_prefix.strip()
                 full_prompt = f"{attachment_prefix}{full_prompt}" if full_prompt else attachment_prefix.strip()
+
+            # Codex tool requests can place tens of thousands of characters before
+            # "Latest request to transform:".  For ChatGPT browser turns, upload that
+            # entire final prefix (including system instructions + tool schemas) as one
+            # Markdown attachment and type only a tiny pointer plus the actual request.
+            if (
+                isinstance(client, ChatGPTClient)
+                and request.tools
+                and request.tool_choice != "none"
+                and _LATEST_REQUEST_MARKER in full_prompt
+            ):
+                marker_index = full_prompt.find(_LATEST_REQUEST_MARKER)
+                externalized_prefix = full_prompt[:marker_index].rstrip()
+                if externalized_prefix:
+                    prompt_prefix_path = _create_prompt_prefix_attachment(externalized_prefix)
+                    file_paths.append(prompt_prefix_path)
+                    attachment_name = os.path.basename(prompt_prefix_path)
+                    full_prompt = _externalize_latest_request_prefix(full_prompt, attachment_name)
+                    if _LATEST_REQUEST_MARKER in prompt:
+                        prompt = _externalize_latest_request_prefix(prompt, attachment_name)
+                    log.info(
+                        "Externalized pre-request context to Markdown: %s (%d chars removed from composer)",
+                        attachment_name,
+                        len(externalized_prefix),
+                    )
 
             cache_key = _cache_key_for_request_with_app(request, app_key)
             stateful_request = bool(
