@@ -515,7 +515,7 @@ curl -X POST http://localhost:8000/v1/responses \
 
 Both `/v1/responses` and `/{app_name}/v1/responses` are supported.
 
-`conversation` and `previous_response_id` are mutually exclusive. Stored routes are partitioned by app-scoped path and optional ChatGPT project. The SQLite route database contains prompt and response text in plaintext; protect and back up `/app/state` accordingly. The default retention is 30 days with a 10,000-route cap.
+`conversation` and `previous_response_id` are mutually exclusive. Stored routes are partitioned by app-scoped path and optional ChatGPT project. The SQLite route database contains prompt and response text in plaintext; protect and back up `/app/state` accordingly. The default retention is 30 days with a 10,000-route cap.\n\nFor Codex-style HTTP clients that send `store: false` together with `session-id` or `x-session-id`, CatGPT reuses the browser tab/thread for that explicit session without creating a durable SQLite response-chain record. This avoids a new-chat navigation on every tool-loop request while keeping requests without a session identity stateless.
 
 ### ChatGPT project confinement
 
