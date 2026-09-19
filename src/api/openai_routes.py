@@ -3874,7 +3874,7 @@ async def _execute_chat_completion(
                         if user_text:
                             _thread_last_user_text[thread_for_contract] = (time.time(), user_text)
 
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
