@@ -94,7 +94,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `tool_choice` | string/object | no | `auto`, `none`, `required`, or specific function |
 | `temperature` | float | no | Ignored (browser controls this) |
 | `max_tokens` | int | no | Ignored |
-| `stream` | bool | no | SSE is accepted for IDE clients such as Cline. The browser finishes first, then CatGPT emits the completed message as event-stream chunks. |
+| `stream` | bool | no | SSE is accepted for IDE clients such as Cline. For ChatGPT, user-facing text is forwarded live from the browser backend SSE stream; tool calls are emitted after CatGPT validates the completed structured payload. Other providers may still complete before emitting SSE chunks. |
 | `read_aloud` | bool | no | Supported on ChatGPT and Gemini. Downloads the browser-generated audio and returns it at `choices[0].message.audio`. |
 | `reasoning_effort` | string | no | Reasoning level for ChatGPT and Gemini. Unsupported values are clamped to the nearest available level or map to thinking models. |
 | `conversation_id` | string | no | Durable logical conversation ID. CatGPT verifies history before reusing the mapped browser thread. |
@@ -470,11 +470,11 @@ curl -X POST http://localhost:8000/v1/responses \
 | `model` | string | yes | `claude-browser` or `catgpt-browser` |
 | `input` | string or array | yes | User input as a string or array of input items with `role` and `content` |
 | `instructions` | string | no | System instructions (converted to a system message) |
-| `tools` | array | no | Tool/function definitions (same format as chat completions) |
+| `tools` | array | no | Function tools in Responses flat form (`type`, `name`, `description`, `parameters`) or Chat Completions nested form. Provider built-ins such as `web_search` are accepted for compatibility but are not executed by CatGPT's browser tool shim. |
 | `tool_choice` | string/object | no | `auto`, `none`, `required`, or specific function |
 | `temperature` | float | no | Ignored |
 | `max_output_tokens` | int | no | Ignored |
-| `stream` | bool | no | Must be `false` (streaming not supported) |
+| `stream` | bool | no | When `true`, ChatGPT opens a Responses SSE stream immediately, emits a short `thinking...` reasoning-summary status item, forwards live user-facing text deltas, and sends periodic SSE keep-alive comments while waiting. Tool calls are emitted as function-call events after validation. |
 | `read_aloud` | bool | no | ChatGPT only (same as chat completions) |
 | `reasoning` | object | no | Reasoning options such as `{"effort":"high"}`. |
 | `conversation` | string/object | no | Durable conversation identifier. An object must contain a non-empty `id`. |
