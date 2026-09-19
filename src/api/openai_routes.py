@@ -1107,7 +1107,7 @@ def _externalize_latest_request_prefix(
     attachment_name: str,
 ) -> str:
     """Replace all text before Latest request to transform with one file pointer."""
-    marker_index = prompt.find(_LATEST_REQUEST_MARKER)
+    marker_index = prompt.rfind(_LATEST_REQUEST_MARKER)
     if marker_index < 0:
         return prompt
     latest_request = prompt[marker_index + len(_LATEST_REQUEST_MARKER):]
@@ -3748,7 +3748,7 @@ async def _execute_chat_completion(
                 and request.tool_choice != "none"
                 and _LATEST_REQUEST_MARKER in full_prompt
             ):
-                marker_index = full_prompt.find(_LATEST_REQUEST_MARKER)
+                marker_index = full_prompt.rfind(_LATEST_REQUEST_MARKER)
                 externalized_prefix = full_prompt[:marker_index].rstrip()
                 if externalized_prefix:
                     prompt_prefix_path = _create_prompt_prefix_attachment(externalized_prefix)
