@@ -17,6 +17,7 @@ from patchright.async_api import async_playwright, BrowserContext, Page, Playwri
 
 from src.config import Config
 from src.browser.stealth import apply_stealth
+from src.chatgpt.backend_stream import LIVE_BACKEND_TEE_SCRIPT
 from src.log import setup_logging
 
 log = setup_logging("browser")
@@ -347,6 +348,11 @@ class BrowserManager:
         else:
             self._page = await self._context.new_page()
 
+        # Install the ChatGPT backend SSE tee before the first real navigation so
+        # application code cannot cache the original fetch implementation first.
+        if Config.PROVIDER == "chatgpt":
+            await self._page.add_init_script(script=LIVE_BACKEND_TEE_SCRIPT)
+
         # NOTE: We intentionally do NOT flush Chrome's DNS cache here.
         # The --host-resolver-rules flag handles DNS resolution for all
         # mapped domains.  Previously, _clear_dns_cache() would navigate
@@ -362,6 +368,8 @@ class BrowserManager:
         if self._context is None:
             raise RuntimeError("Browser not started. Call start() first.")
         page = await self._context.new_page()
+        if Config.PROVIDER == "chatgpt":
+            await page.add_init_script(script=LIVE_BACKEND_TEE_SCRIPT)
         log.info("Opened additional browser tab")
         return page
 
