@@ -979,12 +979,15 @@ class ChatGPTClient:
 
             # add_init_script does not retroactively run in the already-loaded
             # document, so evaluate it as well. The JS guard makes this idempotent.
-            await page.evaluate(LIVE_BACKEND_TEE_SCRIPT)
+            await page.evaluate(LIVE_BACKEND_TEE_SCRIPT, isolated_context=False)
 
     async def _drain_live_backend_queue(self) -> list[list[Any]]:
         """Atomically drain raw SSE chunks captured inside the active page."""
         try:
-            rows = await self._page.evaluate(DRAIN_BACKEND_QUEUE_SCRIPT)
+            rows = await self._page.evaluate(
+                DRAIN_BACKEND_QUEUE_SCRIPT,
+                isolated_context=False,
+            )
         except Exception as exc:
             log.debug("Could not drain live backend SSE queue: %s", exc)
             return []
