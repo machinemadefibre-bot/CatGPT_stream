@@ -2550,19 +2550,45 @@ class ChatGPTClient:
                 raise RuntimeError(f"Could not upload files: {e}")
 
         badge_selector = ", ".join(Selectors.ATTACHMENT_BADGE)
+        expected_names = [Path(path).name for path in valid_paths]
+        upload_confirmed = False
         try:
             await self._page.wait_for_selector(
                 badge_selector,
                 timeout=8000,
                 state="attached",
             )
+            upload_confirmed = True
             log.info("Attachment badge detected in composer")
         except Exception:
-            log.debug("Attachment badge wait timed out, using fallback sleep")
-            await asyncio.sleep(3)
-            if len(valid_paths) > 1:
-                await asyncio.sleep(len(valid_paths))
-        log.info("File upload complete")
+            log.debug("Attachment badge wait timed out; checking visible filenames")
+
+        if not upload_confirmed:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    visible_names = await self._page.evaluate(
+                        """(names) => {
+                            const text = ((document.body && document.body.innerText) || "");
+                            return names.filter((name) => text.includes(name));
+                        }""",
+                        expected_names,
+                    )
+                    if isinstance(visible_names, list) and len(visible_names) == len(expected_names):
+                        upload_confirmed = True
+                        log.info("Attachment filenames detected in composer: %s", expected_names)
+                        break
+                except Exception as exc:
+                    log.debug("Attachment filename confirmation failed: %s", exc)
+                await asyncio.sleep(0.25)
+
+        if not upload_confirmed:
+            raise RuntimeError(
+                "Attachment upload was not confirmed in the ChatGPT composer: "
+                + ", ".join(expected_names)
+            )
+
+        log.info("File upload complete: %s", expected_names)
 
     def _extract_thread_id(self) -> str:
         """Extract the thread/conversation ID from the current URL."""
