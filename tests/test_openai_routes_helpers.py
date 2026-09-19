@@ -256,6 +256,20 @@ class OpenAIRoutesHelpersTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_request_marker_lookup_uses_last_occurrence_anywhere(self) -> None:
+        prompt = (
+            "prefix User prompt:\nfirst "
+            "middle Latest request to transform:\nsecond"
+        )
+        marker = _find_request_marker(prompt)
+        self.assertEqual(
+            marker,
+            (
+                prompt.rfind("Latest request to transform:"),
+                "Latest request to transform:",
+            ),
+        )
+
     def test_tool_prompt_honors_none_required_and_specific_choices(self) -> None:
         tools = [ToolDefinition(function=FunctionDefinition(name="add_numbers"))]
         self.assertEqual(_build_tool_system_prompt(tools, "none"), "")
