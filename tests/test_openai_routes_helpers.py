@@ -89,6 +89,7 @@ from src.api.openai_schemas import (
     ChoiceMessage,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseOutputToolCall,
     ResponsesUsageInfo,
     ToolCall,
     ToolDefinition,
@@ -728,6 +729,165 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertFalse(captured["stream"])
         self.assertIn(b"chat.completion.chunk", body)
         self.assertIn(b"[DONE]", body)
+
+    def test_chat_stream_forwards_live_backend_deltas(self) -> None:
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            live_stream_callback=None,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            if live_stream_callback is not None:
+                live_stream_callback("Hel")
+                await asyncio.sleep(0)
+                live_stream_callback("Hello")
+            return ChatCompletionResponse(
+                id=response_id_override or "chatcmpl-test",
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="Hello"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ChatCompletionRequest(
+                model="catgpt-browser",
+                messages=[ChatMessage(role="user", content="Hello")],
+                stream=True,
+            )
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_chat_completion(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        self.assertIn(b'\"content\":\"Hel\"', body)
+        self.assertIn(b'\"content\":\"lo\"', body)
+        self.assertNotIn(b'\"content\":\"Hello\"', body)
+
+    def test_responses_stream_starts_with_thinking_before_provider_finishes(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            await asyncio.sleep(0.2)
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(
+                        content=[ResponseOutputText(text="done")]
+                    )
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _first_chunk() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                iterator = stream_response.body_iterator.__aiter__()
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.05)
+                if hasattr(iterator, "aclose"):
+                    await iterator.aclose()
+                return chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+
+            first = asyncio.run(_first_chunk())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.created", first)
+
+    def test_responses_stream_emits_thinking_live_text_and_completed(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            live_stream_callback=None,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            if live_stream_callback is not None:
+                live_stream_callback("Hel")
+                await asyncio.sleep(0)
+                live_stream_callback("Hello")
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(
+                        content=[ResponseOutputText(text="Hello")]
+                    )
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.reasoning_summary_text.delta", body)
+        self.assertIn(b"thinking...", body)
+        self.assertIn(b'\"delta\":\"Hel\"', body)
+        self.assertIn(b'\"delta\":\"lo\"', body)
+        self.assertIn(b"response.completed", body)
+
+    def test_responses_stream_emits_function_call_events(self) -> None:
+        async def fake_execute_responses(
+            request: ResponsesRequest,
+            response_id_override=None,
+            **_kwargs,
+        ) -> ResponsesResponse:
+            return ResponsesResponse(
+                id=response_id_override or "resp-test",
+                model=request.model,
+                output=[
+                    ResponseOutputMessage(content=[ResponseOutputText(text="")]),
+                    ResponseOutputToolCall(
+                        id="call_123",
+                        name="shell",
+                        arguments='{"command":"python --version"}',
+                    ),
+                ],
+                usage=ResponsesUsageInfo(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_responses
+        openai_routes_module._execute_responses = fake_execute_responses
+        try:
+            req = ResponsesRequest(
+                model="catgpt-browser",
+                input="Check Python",
+                stream=True,
+            )
+
+            async def _run() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(req)
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run())
+        finally:
+            openai_routes_module._execute_responses = original
+
+        self.assertIn(b"response.function_call_arguments.delta", body)
+        self.assertIn(b"response.function_call_arguments.done", body)
+        self.assertIn(b'\"type\":\"function_call\"', body)
+        self.assertIn(b'\"call_id\":\"call_123\"', body)
 
     def test_execute_responses_accepts_streaming_clients_without_streaming_browser(self) -> None:
         """Responses stream requests are executed as non-stream browser calls."""
