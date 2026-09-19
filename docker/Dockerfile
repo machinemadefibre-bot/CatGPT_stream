@@ -39,6 +39,7 @@ RUN add-pkg \
     libwayland-client0 \
     fonts-liberation \
     fonts-noto-color-emoji \
+    fonts-noto-cjk \
     fonts-dejavu-core \
     curl \
     procps \
