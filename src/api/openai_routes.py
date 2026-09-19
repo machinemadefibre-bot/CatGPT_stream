@@ -2099,7 +2099,7 @@ async def _execute_image_generation(
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -3539,7 +3539,7 @@ async def _execute_chat_completion(
             routing_action = "reuse-current"
             continuing_thread = False
             app_thread_created_by_catgpt = False
-            if Config.API_APP_THREAD_MODE and app_key:
+            if Config.API_APP_THREAD_MODE and app_key and not session_key:
                 log.info("OpenAI app-thread key: %s", app_key)
 
             if fresh_thread:
@@ -3574,6 +3574,14 @@ async def _execute_chat_completion(
                     conversation_key,
                     routing_action,
                 )
+            elif session_key:
+                if lease.is_first_turn:
+                    log.info("OpenAI session route: starting a fresh ChatGPT thread for %s", session_key)
+                    await client.new_chat()
+                    routing_action = "new-chat-session"
+                else:
+                    routing_action = "persistent-session"
+                    continuing_thread = True
             elif Config.API_APP_THREAD_MODE and app_key:
                 now_app = time.time()
                 mapped_thread = ""
@@ -3601,9 +3609,6 @@ async def _execute_chat_completion(
                     await client.new_chat()
                     routing_action = "new-chat-for-app"
                     app_thread_created_by_catgpt = True
-            elif session_key and not lease.is_first_turn:
-                routing_action = "persistent-session"
-                continuing_thread = True
             elif Config.uses_browser():
                 log.info("No session identity: starting a fresh ChatGPT thread")
                 await client.new_chat()
