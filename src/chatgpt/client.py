@@ -1114,10 +1114,10 @@ class ChatGPTClient:
 
     @staticmethod
     def _create_prompt_attachment(text: str) -> str:
-        """Persist a prompt as a UTF-8 temporary file for ChatGPT upload."""
+        """Persist a prompt losslessly as a UTF-8 Markdown attachment."""
         file_descriptor, filename = tempfile.mkstemp(
             prefix="catgpt-long-prompt-",
-            suffix=".txt",
+            suffix=".md",
         )
         try:
             with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
