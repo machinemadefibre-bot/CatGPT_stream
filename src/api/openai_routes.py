@@ -2422,17 +2422,18 @@ def _responses_input_to_messages(
     input_data: str | list,
     instructions: str | None = None,
 ) -> list:
-    """Convert Responses API input to ChatCompletionRequest messages list.
-
-    Supports both string and list-of-input-item formats.
-    Instructions field is prepended as a system message when present.
-    """
+    """Convert Responses input items into the browser chat message model."""
     from src.api.openai_schemas import ChatMessage
 
-    messages = []
+    messages: list[ChatMessage] = []
 
     if instructions:
         messages.append(ChatMessage(role="system", content=instructions))
+
+    def _item_value(item: Any, key: str, default: Any = None) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
 
     def _normalize_content(content: Any):
         if isinstance(content, list):
@@ -2455,19 +2456,104 @@ def _responses_input_to_messages(
 
     if isinstance(input_data, str):
         messages.append(ChatMessage(role="user", content=input_data))
-    elif isinstance(input_data, list):
-        for item in input_data:
-            if isinstance(item, dict):
-                role = item.get("role") or "user"
-                content = _normalize_content(item.get("content"))
-            else:
-                role = getattr(item, "role", "user") or "user"
-                content = _normalize_content(getattr(item, "content", None))
-            messages.append(ChatMessage(role=role, content=content))
-    else:
-        messages.append(ChatMessage(role="user", content=str(input_data)))
+        return messages
+
+    for item in input_data:
+        item_type = str(_item_value(item, "type", "message") or "message")
+
+        if item_type == "function_call":
+            name = str(_item_value(item, "name", "") or "").strip()
+            arguments = _item_value(item, "arguments", "{}")
+            call_id = str(_item_value(item, "call_id", "") or "").strip()
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            if name:
+                messages.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id=call_id or f"call_{uuid.uuid4().hex[:24]}",
+                                function=FunctionCallInfo(name=name, arguments=arguments),
+                            )
+                        ],
+                    )
+                )
+            continue
+
+        if item_type == "function_call_output":
+            call_id = str(_item_value(item, "call_id", "") or "").strip()
+            output = _item_value(item, "output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
+            messages.append(
+                ChatMessage(
+                    role="tool",
+                    content=output,
+                    tool_call_id=call_id or None,
+                )
+            )
+            continue
+
+        role = str(_item_value(item, "role", "user") or "user")
+        content = _normalize_content(_item_value(item, "content"))
+        messages.append(ChatMessage(role=role, content=content))
 
     return messages
+
+
+def _responses_function_tools(
+    tools: list[dict[str, Any]] | None,
+) -> list[ToolDefinition] | None:
+    """Normalize flat/nested Responses function tools; ignore provider built-ins."""
+    normalized: list[ToolDefinition] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type") or "function") != "function":
+            continue
+
+        nested = tool.get("function")
+        source = nested if isinstance(nested, dict) else tool
+        name = str(source.get("name") or "").strip()
+        if not name:
+            continue
+
+        parameters = source.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+
+        normalized.append(
+            ToolDefinition(
+                type="function",
+                function=FunctionDefinition(
+                    name=name,
+                    description=str(source.get("description") or ""),
+                    parameters=parameters,
+                ),
+            )
+        )
+    return normalized or None
+
+
+def _responses_tool_choice(
+    choice: str | dict[str, Any] | None,
+) -> str | dict[str, Any] | None:
+    """Translate Responses flat function choices to Chat Completions shape."""
+    if not isinstance(choice, dict):
+        return choice
+
+    choice_type = str(choice.get("type") or "")
+    if choice_type == "function" and "function" not in choice:
+        name = str(choice.get("name") or "").strip()
+        if name:
+            return {"type": "function", "function": {"name": name}}
+
+    if choice_type and choice_type != "function":
+        return "auto"
+
+    return choice
 
 
 def _responses_request_to_chat_request(
@@ -2476,12 +2562,13 @@ def _responses_request_to_chat_request(
 ) -> ChatCompletionRequest:
     """Translate a ResponsesRequest into a ChatCompletionRequest for execution."""
     messages = _responses_input_to_messages(resp_req.input, resp_req.instructions)
+    function_tools = _responses_function_tools(resp_req.tools)
 
     return ChatCompletionRequest(
         model=resp_req.model,
         messages=messages,
-        tools=resp_req.tools,
-        tool_choice=resp_req.tool_choice,
+        tools=function_tools,
+        tool_choice=_responses_tool_choice(resp_req.tool_choice),
         temperature=resp_req.temperature,
         max_tokens=resp_req.max_output_tokens,
         top_p=resp_req.top_p,
@@ -2498,26 +2585,27 @@ def _responses_response_from_chat(
     model: str,
     response_id: str | None = None,
 ) -> ResponsesResponse:
-    """Translate a ChatCompletionResponse into a Responses API response envelope.
-
-    Converts choices[0].message.content into response output items.
-    """
+    """Translate a Chat Completion response into Responses API shape."""
     output_items: list[ResponseOutputMessage | ResponseOutputToolCall] = []
+    text_parts: list[str] = []
 
     for choice in chat_response.choices:
         msg_text = choice.message.content or ""
-        output_items.append(
-            ResponseOutputMessage(
-                content=[
-                    ResponseOutputText(text=msg_text),
-                ],
+        if msg_text:
+            text_parts.append(msg_text)
+            output_items.append(
+                ResponseOutputMessage(
+                    status="completed",
+                    content=[ResponseOutputText(text=msg_text)],
+                )
             )
-        )
-        tool_calls = choice.message.tool_calls or []
-        for call in tool_calls:
+
+        for call in choice.message.tool_calls or []:
             output_items.append(
                 ResponseOutputToolCall(
-                    id=call.id,
+                    id=f"fc_{uuid.uuid4().hex[:24]}",
+                    call_id=call.id,
+                    status="completed",
                     name=call.function.name,
                     arguments=call.function.arguments,
                 )
@@ -2529,8 +2617,11 @@ def _responses_response_from_chat(
     )
     return ResponsesResponse(
         id=resolved_response_id,
+        created_at=chat_response.created,
+        status="completed",
         model=model,
         output=output_items,
+        output_text="".join(text_parts),
         usage=ResponsesUsageInfo(
             input_tokens=chat_response.usage.prompt_tokens,
             output_tokens=chat_response.usage.completion_tokens,
@@ -2749,9 +2840,10 @@ async def _stream_responses(
             except Exception:
                 pass
 
+        function_tools = _responses_function_tools(request.tools)
         live_callback = (
             None
-            if request.tools and request.tool_choice != "none"
+            if function_tools and request.tool_choice != "none"
             else on_delta
         )
 
@@ -3027,8 +3119,8 @@ async def _stream_responses(
         for tool in tool_items:
             output_index = next_output_index
             next_output_index += 1
-            call_id = tool.id
-            function_item_id = f"fc_{uuid.uuid4().hex[:24]}"
+            call_id = tool.call_id or tool.id
+            function_item_id = tool.id if tool.call_id else f"fc_{uuid.uuid4().hex[:24]}"
             added_item = {
                 "id": function_item_id,
                 "type": "function_call",
