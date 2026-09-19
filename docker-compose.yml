@@ -39,7 +39,7 @@ services:
       HEADLESS: "false"
       SLOW_MO: 50
       # Optional browser-only proxy (for example a Tailscale SOCKS sidecar)
-      BROWSER_PROXY_SERVER: ${BROWSER_PROXY_SERVER:-}
+      BROWSER_PROXY_SERVER: "${BROWSER_PROXY_SERVER:-}"
       # Provider: "chatgpt", "claude", "gemini", or "minimax"
       PROVIDER: ${PROVIDER:-chatgpt}
       # ChatGPT
@@ -70,7 +70,7 @@ services:
       API_HOST: "0.0.0.0"
       API_PORT: 8000
       API_TOKEN: ${CATGPT_API_KEY:-dummy123}
-      API_TOKEN_OPTIONAL: ${API_TOKEN_OPTIONAL:-false}
+      API_TOKEN_OPTIONAL: "${API_TOKEN_OPTIONAL:-false}"
       # Optional: keep large system instructions in thread context and send compact reminders
       API_THREAD_CONTRACT_MODE: "true"
       API_THREAD_CONTRACT_TTL_SECONDS: 3600
