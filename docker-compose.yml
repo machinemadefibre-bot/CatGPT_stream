@@ -1,7 +1,7 @@
 services:
   # CatGPT Gateway - Enhanced Container Mock for Chat Apps
   catgpt:
-    image: ${CATGPT_IMAGE:-ghcr.io/thebadfella/catgpt:latest}
+    image: ${CATGPT_IMAGE:-catgpt-local:latest}
     pull_policy: ${CATGPT_PULL_POLICY:-missing}
     build:
       context: .
@@ -19,8 +19,8 @@ services:
     networks:
       - app_services
     ports:
-      - "8650:8000" # API Port
-      - "5800:5800" # jlesage Web GUI (HTTP, or HTTPS with SECURE_CONNECTION=1)
+      - "127.0.0.1:8650:8000" # API Port (publish externally through a reverse tunnel/proxy)
+      - "127.0.0.1:5800:5800" # jlesage Web GUI (keep private by default)
       # - "5900:5900" # Direct VNC port (optional)
     tmpfs:
       - /tmp:exec,mode=1777
@@ -38,6 +38,8 @@ services:
       # Browser (headed on virtual display)
       HEADLESS: "false"
       SLOW_MO: 50
+      # Optional browser-only proxy (for example a Tailscale SOCKS sidecar)
+      BROWSER_PROXY_SERVER: ${BROWSER_PROXY_SERVER:-}
       # Provider: "chatgpt", "claude", "gemini", or "minimax"
       PROVIDER: ${PROVIDER:-chatgpt}
       # ChatGPT
@@ -68,7 +70,7 @@ services:
       API_HOST: "0.0.0.0"
       API_PORT: 8000
       API_TOKEN: ${CATGPT_API_KEY:-dummy123}
-      API_TOKEN_OPTIONAL: "true"
+      API_TOKEN_OPTIONAL: ${API_TOKEN_OPTIONAL:-false}
       # Optional: keep large system instructions in thread context and send compact reminders
       API_THREAD_CONTRACT_MODE: "true"
       API_THREAD_CONTRACT_TTL_SECONDS: 3600
