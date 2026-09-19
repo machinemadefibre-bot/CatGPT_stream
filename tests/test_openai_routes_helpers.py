@@ -655,7 +655,8 @@ class ResponsesAPITests(unittest.TestCase):
         )
         resp = _responses_response_from_chat(chat_response, "catgpt-browser")
         self.assertEqual(len(resp.output), 2)
-        self.assertEqual(resp.output[1].type, "tool_call")
+        self.assertEqual(resp.output[1].type, "function_call")
+        self.assertEqual(resp.output[1].call_id, "call_123")
 
     def test_execute_responses_forwards_app_key_override(self) -> None:
         """Responses execution preserves app-scoped routing keys."""
