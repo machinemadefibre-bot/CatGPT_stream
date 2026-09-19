@@ -58,7 +58,7 @@ CatGPT turns a logged-in browser session into familiar API endpoints. ChatGPT, C
 </table>
 
 > [!TIP]
-> Long-prompt fallback is enabled by default. If ChatGPT disables direct submission, CatGPT uploads the complete request as a temporary UTF-8 attachment. The flow has been validated with a 1.4-million-character request.
+> Long-prompt fallback is enabled by default. If ChatGPT disables direct submission, CatGPT uploads the complete request losslessly as a temporary UTF-8 Markdown attachment. The flow has been validated with a 1.4-million-character request.
 
 ## Fork vs Upstream
 
