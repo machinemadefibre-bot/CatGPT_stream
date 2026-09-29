@@ -83,7 +83,13 @@ MimicGate adds extensive multi-protocol support, provider coverage, and resilien
 </table>
 
 > [!TIP]
-> Long-prompt fallback is enabled by default. If a provider disables direct submission for oversized text, MimicGate automatically uploads the prompt as a temporary UTF-8 attachment. This flow has been validated with requests exceeding 1.4 million characters.
+> Long-prompt fallback is enabled by default. If a provider disables direct submission for oversized text, MimicGate automatically uploads the prompt losslessly as a temporary UTF-8 Markdown attachment. This flow has been validated with requests exceeding 1.4 million characters.
+
+> [!NOTE]
+> For the ChatGPT browser provider, `stream=true` forwards live user-facing text from ChatGPT's `/backend-api/conversation` SSE stream. Responses streams open immediately with a short `thinking...` reasoning-summary item and periodic keep-alive comments while the model is still reasoning. Structured tool calls are emitted after the completed payload is validated; other providers may still complete before emitting streaming chunks.
+
+> [!TIP]
+> On ChatGPT tool/function requests, MimicGate externalizes everything before `Latest request to transform:` into a temporary Markdown attachment. The browser composer receives only a short attachment pointer plus the latest request, preserving the full original context without pasting the large first-turn tool/system prefix into the composer.
 
 ---
 

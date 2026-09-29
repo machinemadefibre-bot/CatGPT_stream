@@ -26,15 +26,17 @@ These are the variables consumed directly by `docker-compose.yml`:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `DOCKERDIR` | `.` | Host directory under which persistent `appdata/mimicgate` volumes are created. |
-| `MIMICGATE_IMAGE` | `ghcr.io/thebadfella/mimicgate:latest` | Container image used by Compose. |
+| `MIMICGATE_IMAGE` | `catgpt-local:latest` | Container image built/used by Compose. |
 | `CATGPT_IMAGE` | _empty_ | Legacy alias for `MIMICGATE_IMAGE`. |
 | `MIMICGATE_PULL_POLICY` | `missing` | Compose image pull policy. |
 | `CATGPT_PULL_POLICY` | _empty_ | Legacy alias for `MIMICGATE_PULL_POLICY`. |
 | `MIMICGATE_USER_ID` | `1000` | Host user ID mapped to container `USER_ID`. |
 | `CATGPT_USER_ID` | _empty_ | Legacy alias for `MIMICGATE_USER_ID`. |
 | `MIMICGATE_GROUP_ID` | `1000` | Host group ID mapped to container `GROUP_ID`. |
+| `BROWSER_PROXY_SERVER` | _empty_ | Optional browser-only proxy passed through to the container. |
 | `CATGPT_GROUP_ID` | _empty_ | Legacy alias for `MIMICGATE_GROUP_ID`. |
 | `MIMICGATE_API_KEY` | `dummy123` | Value passed to container `API_TOKEN`. |
+| `API_TOKEN_OPTIONAL` | `false` | Allow unauthenticated API requests when a token is configured. |
 | `CATGPT_API_KEY` | _empty_ | Legacy alias for `MIMICGATE_API_KEY`. |
 | `MIMICGATE_VNC_PASSWORD` | `mimicgate` | Value passed to container `VNC_PASSWORD`. |
 | `CATGPT_VNC_PASSWORD` | _empty_ | Legacy alias for `MIMICGATE_VNC_PASSWORD`. |
@@ -84,6 +86,7 @@ When running Python directly, set these in the shell or root `.env`. In Docker, 
 | `HEADLESS` | `false` | Run the automated browser without a visible window. |
 | `BROWSER_CHANNEL` | `chrome` | Playwright browser channel. |
 | `BROWSER_DATA_DIR` | `browser_data` | Persistent browser-profile directory. |
+| `BROWSER_PROXY_SERVER` | _empty_ | Optional Playwright proxy server, for example `socks5://tailscale-egress:1055`. |
 | `AUTO_LOGIN_INTERACTIVE` | `auto` | Force (`true`) or disable (`false`) terminal login prompts; `auto` follows TTY availability. |
 | `SLOW_MO` | `25` | Delay in milliseconds after Playwright operations. |
 | `MAX_CONCURRENT_REQUESTS` | `3` | Maximum requests processed concurrently. |

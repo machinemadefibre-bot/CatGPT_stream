@@ -159,7 +159,7 @@ class LongPromptFallbackTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(client.upload_calls), 1)
         uploaded = client.upload_calls[0]
         self.assertEqual(uploaded[0], "existing.pdf")
-        self.assertTrue(uploaded[-1].endswith(".txt"))
+        self.assertTrue(uploaded[-1].endswith(".md"))
         self.assertEqual(Path(uploaded[-1]).exists(), False)
         self.assertIn("Read the attached file", typed[1])
 

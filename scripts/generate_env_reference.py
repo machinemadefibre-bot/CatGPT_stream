@@ -34,6 +34,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
         ("HEADLESS", "false", "Run the automated browser without a visible window."),
         ("BROWSER_CHANNEL", "chrome", "Playwright browser channel."),
         ("BROWSER_DATA_DIR", "browser_data", "Persistent browser-profile directory."),
+        ("BROWSER_PROXY_SERVER", "empty", "Optional Playwright proxy server, for example `socks5://tailscale-egress:1055`."),
         ("AUTO_LOGIN_INTERACTIVE", "auto", "Force (`true`) or disable (`false`) terminal login prompts; `auto` follows TTY availability."),
         ("SLOW_MO", "25", "Delay in milliseconds after Playwright operations."),
         ("MAX_CONCURRENT_REQUESTS", "3", "Maximum requests processed concurrently."),
@@ -116,7 +117,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
 
 COMPOSE_INPUTS: tuple[tuple[str, str, str], ...] = (
     ("DOCKERDIR", ".", "Host directory under which persistent `appdata/mimicgate` volumes are created."),
-    ("MIMICGATE_IMAGE", "ghcr.io/thebadfella/mimicgate:latest", "Container image used by Compose."),
+    ("MIMICGATE_IMAGE", "catgpt-local:latest", "Container image built/used by Compose."),
     ("CATGPT_IMAGE", "empty", "Legacy alias for `MIMICGATE_IMAGE`."),
     ("MIMICGATE_PULL_POLICY", "missing", "Compose image pull policy."),
     ("CATGPT_PULL_POLICY", "empty", "Legacy alias for `MIMICGATE_PULL_POLICY`."),
@@ -124,8 +125,10 @@ COMPOSE_INPUTS: tuple[tuple[str, str, str], ...] = (
     ("CATGPT_USER_ID", "empty", "Legacy alias for `MIMICGATE_USER_ID`."),
     ("MIMICGATE_GROUP_ID", "1000", "Host group ID mapped to container `GROUP_ID`."),
     ("CATGPT_GROUP_ID", "empty", "Legacy alias for `MIMICGATE_GROUP_ID`."),
+    ("BROWSER_PROXY_SERVER", "empty", "Optional browser-only proxy passed through to the container."),
     ("MIMICGATE_API_KEY", "dummy123", "Value passed to container `API_TOKEN`."),
     ("CATGPT_API_KEY", "empty", "Legacy alias for `MIMICGATE_API_KEY`."),
+    ("API_TOKEN_OPTIONAL", "false", "Allow unauthenticated API requests when a token is configured."),
     ("MIMICGATE_VNC_PASSWORD", "mimicgate", "Value passed to container `VNC_PASSWORD`."),
     ("CATGPT_VNC_PASSWORD", "empty", "Legacy alias for `MIMICGATE_VNC_PASSWORD`."),
     ("MIMICGATE_VNC_PORT", "5800", "Host port mapped to the web GUI / VNC session."),

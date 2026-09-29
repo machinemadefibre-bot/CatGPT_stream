@@ -17,6 +17,7 @@ from patchright.async_api import async_playwright, BrowserContext, Page, Playwri
 
 from src.config import Config
 from src.browser.stealth import apply_stealth
+from src.chatgpt.backend_stream import LIVE_BACKEND_TEE_SCRIPT
 from src.log import setup_logging
 
 log = setup_logging("browser")
@@ -42,6 +43,15 @@ def _resolve_domains_for_chrome() -> str:
 
     Returns empty string if all resolutions fail.
     """
+    # A configured browser proxy should resolve target hostnames itself.
+    # Pre-resolving on the Docker host would pin ChatGPT/Claude/Gemini to an
+    # edge selected from the host region, then send that IP through the proxy
+    # exit region (for example SG -> AU -> SG), adding latency and leaking the
+    # host resolver's location into routing.
+    if os.environ.get("BROWSER_PROXY_SERVER", "").strip():
+        log.info("Browser proxy configured; skipping local provider-domain pre-resolution")
+        return ""
+
     # Only needed in Docker (check for /.dockerenv or DISPLAY=:99).
     if not _is_docker_runtime():
         return ""
@@ -311,6 +321,16 @@ class BrowserManager:
             timezone_id="America/Los_Angeles",
             args=chrome_args,
         )
+        proxy_server = os.environ.get("BROWSER_PROXY_SERVER", "").strip()
+        if proxy_server:
+            # Chromium may otherwise prefer HTTP/3/QUIC for upload/CDN hosts.
+            # SOCKS proxying here is TCP-only, so force proxied browser traffic
+            # onto TCP (HTTP/2 or HTTP/1.1) instead of allowing a UDP QUIC path
+            # that bypasses or fails outside the proxy tunnel.
+            chrome_args.append("--disable-quic")
+            launch_kwargs["proxy"] = {"server": proxy_server}
+            log.info("Browser proxy enabled; QUIC disabled for TCP-only proxy transport")
+
         if in_docker:
             launch_kwargs["no_viewport"] = True
         else:
@@ -347,6 +367,11 @@ class BrowserManager:
         else:
             self._page = await self._context.new_page()
 
+        # Install the ChatGPT backend SSE tee before the first real navigation so
+        # application code cannot cache the original fetch implementation first.
+        if Config.PROVIDER == "chatgpt":
+            await self._page.add_init_script(script=LIVE_BACKEND_TEE_SCRIPT)
+
         # NOTE: We intentionally do NOT flush Chrome's DNS cache here.
         # The --host-resolver-rules flag handles DNS resolution for all
         # mapped domains.  Previously, _clear_dns_cache() would navigate
@@ -362,6 +387,8 @@ class BrowserManager:
         if self._context is None:
             raise RuntimeError("Browser not started. Call start() first.")
         page = await self._context.new_page()
+        if Config.PROVIDER == "chatgpt":
+            await page.add_init_script(script=LIVE_BACKEND_TEE_SCRIPT)
         log.info("Opened additional browser tab")
         return page
 
