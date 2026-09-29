@@ -2051,6 +2051,7 @@ async def _execute_image_generation(
     _deletion_pending: list[str] = []
     app_key = (app_key_override or "").strip()
     session_key = _tab_session_key(request, http_request, app_key)
+    explicit_session = _responses_has_stable_session(http_request)
 
     try:
         async with acquire_browser_page(session_key) as lease:
@@ -2113,7 +2114,7 @@ async def _execute_image_generation(
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            if Config.API_APP_THREAD_MODE and app_key and not session_key:
+            if Config.API_APP_THREAD_MODE and app_key and not explicit_session:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
@@ -2183,13 +2184,6 @@ async def _execute_image_generation(
 
             return ImagesResponse(data=image_data_list)
     finally:
-        if prompt_prefix_path:
-            try:
-                os.unlink(prompt_prefix_path)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log.debug("Could not remove temporary prompt-prefix attachment %s: %s", prompt_prefix_path, exc)
         if _deletion_pending:
             asyncio.create_task(_maybe_delete_expired_app_threads(_deletion_pending))
 
@@ -3537,6 +3531,7 @@ async def _execute_chat_completion(
             request, deep=True, update={"conversation_id": header_conversation_id}
         )
     session_key = None if fresh_thread else _tab_session_key(request, http_request, app_key)
+    explicit_session = False if fresh_thread else _responses_has_stable_session(http_request)
 
     # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
@@ -3553,7 +3548,7 @@ async def _execute_chat_completion(
             routing_action = "reuse-current"
             continuing_thread = False
             app_thread_created_by_catgpt = False
-            if Config.API_APP_THREAD_MODE and app_key and not session_key:
+            if Config.API_APP_THREAD_MODE and app_key and not explicit_session:
                 log.info("OpenAI app-thread key: %s", app_key)
 
             if fresh_thread:
@@ -3588,7 +3583,7 @@ async def _execute_chat_completion(
                     conversation_key,
                     routing_action,
                 )
-            elif session_key:
+            elif explicit_session:
                 if lease.is_first_turn:
                     log.info("OpenAI session route: starting a fresh ChatGPT thread for %s", session_key)
                     await client.new_chat()
@@ -3623,6 +3618,9 @@ async def _execute_chat_completion(
                     await client.new_chat()
                     routing_action = "new-chat-for-app"
                     app_thread_created_by_catgpt = True
+            elif session_key and not lease.is_first_turn:
+                routing_action = "persistent-session"
+                continuing_thread = True
             elif Config.uses_browser():
                 log.info("No session identity: starting a fresh ChatGPT thread")
                 await client.new_chat()
@@ -3888,7 +3886,7 @@ async def _execute_chat_completion(
                         if user_text:
                             _thread_last_user_text[thread_for_contract] = (time.time(), user_text)
 
-            if Config.API_APP_THREAD_MODE and app_key and not session_key:
+            if Config.API_APP_THREAD_MODE and app_key and not explicit_session:
                 thread_for_app = result.thread_id or client._extract_thread_id()
                 if thread_for_app:
                     post_prune_expired: list[str] = []
